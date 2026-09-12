@@ -1,21 +1,17 @@
 --[[
 ===============================================================================
-LockOnFovChanger v1.1.77
+LockOnFovChanger v1.3.25
 UE4SS mod for The Blood of Dawnwalker — Lock-On camera control
 Author: josky
 ===============================================================================
 
 FEATURES
 --------
-- Change Lock-On FOV
-- Raise combat camera height / look-down angle (Offset Z while in combat)
-- Optional shoulder/lateral Offset Y fix (centered lock)
-- Keep camera attached to the lock target during Lock-On
-- Handle temporary combat camera layers without breaking Lock-On
-- PageDown = master OFF (restore original camera)
+- Combat FOV: Enter combat mode to enable custom FOV, exit combat mode will return game FOV
+- Lock-On Offset Z + EnemyOffset Y: instant apply on Lock-On, restore on Lock-Off
 - PageUp   = master ON  (re-apply INI settings)
+- PageDown = master OFF (restore original camera)
 - clo fovstatus / clo ui = show settings (UMG overlay disabled; crashes on this game)
-- Stability: fewer hot-path camera writes during abilities/stack changes
 
 INSTALL
 -------
@@ -27,10 +23,10 @@ INSTALL
 
 INI  (LockOnFovChanger.ini)
 ----
-FOVEnabled=true/false     Enable Lock-On FOV change
-LockOnFOV=110             FOV while locked (normal game FOV is ~90)
-LockOnOffsetZ=70          Combat Offset Z (applied on combat enter, removed on combat exit)
-CameraOffsetFix=true/false  true = center lateral offset (Y=0); false = keep game Y
+FOVEnabled=true/false     Enable combat FOV tween (on combat enter/exit)
+LockOnFOV=110             Target combat FOV (normal game FOV is ~90)
+LockOnOffsetZ=30          Lock-On Offset Z (instant on Lock-On, restore on Lock-Off)
+EnemyOffset=120           Lock-On CameraLocationOffsetDuringTargeting.Y (120 = game default)
 EnableLog=true/false      Diagnostic log file (keep false for normal play)
 
 CONSOLE  (prefix: clo)
@@ -38,24 +34,27 @@ CONSOLE  (prefix: clo)
 clo mod 0 | clo mod 1              Master OFF / ON (same as PageDown / PageUp)
 clo fov 0 | clo fov 1              FOV feature OFF / ON
 clo fov value <1-179>              Set LockOnFOV now
-clo offset 0 | clo offset 1        CameraOffsetFix OFF / ON
+clo offset 0 | clo offset 1        EnemyOffset disable / enable
+clo offset value <number>          Set EnemyOffset Y (120 = game default)
 clo z <value>                      Set LockOnOffsetZ for this session
 clo ui                             Show current settings / Lock-On state
 clo fovstatus                      Same as clo ui
 clo ver                            Show mod version
+clo mark                           Log USER MARK CombatOver (same as End)
 
 ]]
-local MOD_NAME = "LockOnFovChanger_v1.1.77"
-local SCRIPT_VERSION = "1.1.77"
+local MOD_NAME = "LockOnFovChanger_v1.3.25"
+local SCRIPT_VERSION = "1.3.25"
 
 local HARD_LOCK_FUNCTION = "/Script/DogwoodCombat.PlayerCombatComponent:SetHardLock"
 local CAMERA_MODE_CLASS = "RebelCameraMode"
 local COMBAT_CAMERA_MODE_CLASS = "/Script/DogwoodCombat.CombatCameraMode"
+local COMBAT_COMPONENT_CLASS = "PlayerCombatComponent"
 
 local CAMERA_TYPE_NONE = 0
 local CAMERA_TYPE_DEFAULT = 1
 
-local POLL_MS = 100
+local POLL_MS = 150
 local CACHE_WARMUP_MS = 1000
 
 local ENABLE_LOG_DEFAULT = false
@@ -65,11 +64,13 @@ local ENABLE_INPUT_DIAGNOSTIC = false
 local UEHelpers = require("UEHelpers")
 local GetPlayerController = UEHelpers.GetPlayerController
 
+local COMBAT_OFFSET_DEFAULT_Y = 120.0
+
 local CONFIG_DEFAULTS = {
     FOVEnabled = true,
     LockOnFOV = 110.0,
     LockOnOffsetZ = 70.0,
-    CameraOffsetFix = false,
+    EnemyOffset = COMBAT_OFFSET_DEFAULT_Y,
     EnableLog = ENABLE_LOG_DEFAULT,
 }
 
@@ -77,7 +78,7 @@ local config = {
     FOVEnabled = CONFIG_DEFAULTS.FOVEnabled,
     LockOnFOV = CONFIG_DEFAULTS.LockOnFOV,
     LockOnOffsetZ = CONFIG_DEFAULTS.LockOnOffsetZ,
-    CameraOffsetFix = CONFIG_DEFAULTS.CameraOffsetFix,
+    EnemyOffset = CONFIG_DEFAULTS.EnemyOffset,
     EnableLog = CONFIG_DEFAULTS.EnableLog,
 }
 
@@ -162,8 +163,15 @@ local function load_external_config()
                     if number ~= nil then
                         config.LockOnOffsetZ = number
                     end
-                elseif key == "CameraOffsetFix" then
-                    config.CameraOffsetFix = parse_bool(value, config.CameraOffsetFix)
+                elseif key == "EnemyOffset" then
+                    local number = tonumber(value)
+                    if number ~= nil then
+                        config.EnemyOffset = number
+                    end
+                elseif key == "EnemyOffsetEnabled" or key == "CameraOffsetFix" then
+                    if not parse_bool(value, true) then
+                        config.EnemyOffset = COMBAT_OFFSET_DEFAULT_Y
+                    end
                 elseif key == "EnableLog" then
                     config.EnableLog = parse_bool(value, config.EnableLog)
                 end
@@ -180,11 +188,13 @@ load_external_config()
 local log_path = nil
 
 local function build_log_path()
+    local prefix = "LockOnFovChanger_v" .. SCRIPT_VERSION .. "_"
+    local stamp = os.date("%Y%m%d_%H%M%S") .. ".log"
     if script_directory == nil or script_directory == "" then
-        return "LockOnFovChanger_v1.1.77_" .. os.date("%Y%m%d_%H%M%S") .. ".log"
+        return prefix .. stamp
     end
 
-    return script_directory .. "\\LockOnFovChanger_v1.1.77_" .. os.date("%Y%m%d_%H%M%S") .. ".log"
+    return script_directory .. "\\" .. prefix .. stamp
 end
 
 if config.EnableLog then
@@ -233,8 +243,8 @@ if config.EnableLog then
             tostring(config.LockOnFOV) ..
             " | LockOnOffsetZ=" ..
             tostring(config.LockOnOffsetZ) ..
-            " | CameraOffsetFix=" ..
-            tostring(config.CameraOffsetFix) ..
+            " | EnemyOffset=" ..
+            tostring(config.EnemyOffset) ..
             " | EnableLog=" ..
             tostring(config.EnableLog) ..
             "\n"
@@ -269,9 +279,88 @@ function CloUtil.is_hot_fov_write_quiet()
     return (os.clock() * 1000.0) < (overlay.quiet_until_ms or 0)
 end
 
+CloUtil.combat_fov = {
+    generation = 0,
+    direction = nil,
+    paused = false,
+    poll_active = false,
+    pending_enter = false,
+    session_active = false,
+    last_state = nil,
+    lock_writes_deferred = false,
+    exit_pending = 0,
+    exit_confirm_polls = 2,
+    exit_confirm_ms = 2000,
+    exit_zero_since_ms = nil,
+    duration_ms = 350,
+    tick_ms = 33,
+    start_ms = 0,
+    from_by_address = {},
+    last_manager_fov = nil,
+    last_stack_push_ms = nil,
+    last_view_publish_ms = nil,
+    last_reassert_ms = nil,
+    reassert_cooldown_ms = 800,
+    resolve_miss_logged = false,
+    stack_push_interval_ms = 300,
+    view_publish_interval_ms = 200,
+    last_catchup_ms = nil,
+    catchup_cooldown_ms = 2000,
+    fov_type_pulse_done = false,
+    fov_type_pulse_pending = false,
+    restore_view_fov = nil,
+    sheath_abort_rearm_pending = false,
+}
+
 function CloUtil.mark_overlay_recovery_quiet()
     local overlay = CloUtil.stack_overlay
     overlay.quiet_until_ms = (os.clock() * 1000.0) + (overlay.quiet_ms or 250)
+end
+
+function CloUtil.combat_component_path_text(component)
+    if component == nil then
+        return ""
+    end
+
+    local ok, name = pcall(function()
+        return component:GetFullName()
+    end)
+    if ok and name ~= nil then
+        return tostring(name)
+    end
+
+    return tostring(component)
+end
+
+function CloUtil.is_cutscene_combat_component(component)
+    local path = string.lower(CloUtil.combat_component_path_text(component))
+    if path == "" then
+        return false
+    end
+
+    return path:find("cutscene", 1, true) ~= nil or
+        path:find("moviescene", 1, true) ~= nil or
+        path:find("_ls.", 1, true) ~= nil
+end
+
+function CloUtil.score_combat_component(component)
+    local path = string.lower(CloUtil.combat_component_path_text(component))
+    if path == "" then
+        return -1
+    end
+
+    local score = 0
+    if path:find("persistentlevel", 1, true) ~= nil then
+        score = score + 1000
+    end
+    if path:find("bp_playercharacter", 1, true) ~= nil then
+        score = score + 500
+    end
+    if CloUtil.is_cutscene_combat_component(component) then
+        score = score - 10000
+    end
+
+    return score
 end
 
 function CloUtil.get_ini_path()
@@ -287,7 +376,7 @@ function CloUtil.save_external_config()
         "FOVEnabled=" .. tostring(config.FOVEnabled),
         "LockOnFOV=" .. tostring(config.LockOnFOV),
         "LockOnOffsetZ=" .. tostring(config.LockOnOffsetZ),
-        "CameraOffsetFix=" .. tostring(config.CameraOffsetFix),
+        "EnemyOffset=" .. tostring(config.EnemyOffset),
         "EnableLog=" .. tostring(config.EnableLog),
         "",
     }
@@ -345,6 +434,102 @@ local function get_field(owner, field_name)
 
     if ok then
         return value
+    end
+
+    return nil
+end
+
+function CloUtil.combat_from_outer_object(object)
+    local current = object
+    for _ = 1, 8 do
+        if not valid_object(current) then
+            break
+        end
+
+        local field_names = {
+            "CombatComponent",
+            "PlayerCombatComponent",
+            "Combat",
+        }
+        for _, field_name in ipairs(field_names) do
+            local candidate = get_field(current, field_name)
+            if candidate ~= nil then
+                candidate = hook_object(candidate) or candidate
+            end
+            if valid_object(candidate) and
+                not CloUtil.is_cutscene_combat_component(candidate) then
+                return candidate
+            end
+        end
+
+        local outer = nil
+        pcall(function()
+            outer = current:GetOuter()
+        end)
+        if outer == nil or outer == current then
+            break
+        end
+        current = outer
+    end
+
+    return nil
+end
+
+function CloUtil.find_player_combat_component()
+    if type(GetPlayerController) ~= "function" then
+        return nil
+    end
+
+    local controller = GetPlayerController()
+    if not valid_object(controller) then
+        return nil
+    end
+
+    local pawn = nil
+    pcall(function()
+        if controller.GetPawn ~= nil then
+            pawn = controller:GetPawn()
+        elseif controller.Pawn ~= nil then
+            pawn = controller.Pawn
+        elseif controller.AcknowledgedPawn ~= nil then
+            pawn = controller.AcknowledgedPawn
+        end
+    end)
+    if not valid_object(pawn) then
+        return nil
+    end
+
+    local from_pawn = CloUtil.combat_from_outer_object(pawn)
+    if valid_object(from_pawn) then
+        return from_pawn
+    end
+
+    local by_class = nil
+    pcall(function()
+        if pawn.GetComponentByClass ~= nil then
+            by_class = pawn:GetComponentByClass(COMBAT_COMPONENT_CLASS)
+        end
+    end)
+    if by_class ~= nil then
+        by_class = hook_object(by_class) or by_class
+    end
+    if valid_object(by_class) and
+        not CloUtil.is_cutscene_combat_component(by_class) then
+        return by_class
+    end
+
+    return nil
+end
+
+function CloUtil.resolve_combat_component(cached)
+    local player_component = CloUtil.find_player_combat_component()
+    if valid_object(player_component) then
+        return player_component
+    end
+
+    if valid_object(cached) and
+        not CloUtil.is_cutscene_combat_component(cached) then
+        return cached
     end
 
     return nil
@@ -461,7 +646,6 @@ end
 
 -- Combat-state observer. CurrentCombatMode 0<->nonzero drives combat Offset Z;
 -- nonzero->0 also triggers Lock-Off cleanup when a session is still active.
-local COMBAT_COMPONENT_CLASS = "PlayerCombatComponent"
 local COMBAT_STATE_POLL_MS = 500
 local combat_component = nil
 local combat_state_last = nil
@@ -495,8 +679,89 @@ local mod_enabled = true
 local test_camera_suspended = false
 local lock_camera_test_suspended = false
 
-local COMBAT_OFFSET_DEFAULT_Y = 120.0
-local COMBAT_OFFSET_FIX_Y = 0.0
+function CloUtil.enemy_offset_target_y()
+    return tonumber(config.EnemyOffset) or COMBAT_OFFSET_DEFAULT_Y
+end
+
+local function object_address(object)
+    if object == nil then
+        return nil
+    end
+
+    local ok, address = pcall(function()
+        return object:GetAddress()
+    end)
+
+    if ok and address ~= nil then
+        return tostring(address)
+    end
+
+    return nil
+end
+
+local function find_combat_component()
+    if tracked_combat ~= nil and valid_object(tracked_combat) then
+        if combat_component == nil or
+            object_address(tracked_combat) ~= object_address(combat_component) then
+            set_combat_component(tracked_combat, "TrackedCombat")
+        end
+        return combat_component
+    end
+
+    if valid_object(combat_component) and
+        not CloUtil.is_cutscene_combat_component(combat_component) then
+        return combat_component
+    end
+
+    local resolved = CloUtil.resolve_combat_component(combat_component)
+    if resolved == nil then
+        combat_component = nil
+        return nil
+    end
+
+    local resolved_address = object_address(resolved)
+    local cached_address = object_address(combat_component)
+    if cached_address == nil or cached_address ~= resolved_address then
+        set_combat_component(resolved, "Resolve")
+    end
+
+    return combat_component
+end
+
+local function camera_from_combat(combat)
+    if combat == nil then
+        return nil
+    end
+
+    local owner = nil
+    pcall(function()
+        owner = combat:GetOwner()
+    end)
+
+    if owner == nil then
+        return nil
+    end
+
+    local camera = get_field(owner, "FollowCamera")
+
+    if valid_object(camera) then
+        return camera
+    end
+
+    return nil
+end
+
+local function get_player_camera_manager()
+    local controller = nil
+    local manager = nil
+    pcall(function()
+        controller = GetPlayerController()
+    end)
+    if valid_object(controller) then
+        manager = get_field(controller, "PlayerCameraManager")
+    end
+    return controller, manager
+end
 
 -- CameraModeStack is used only to protect the camera during temporary
 -- combat/attack camera modes. It never controls Lock-On session lifecycle.
@@ -690,6 +955,962 @@ local function recover_fov_cache_and_write()
     return write_locked_fov()
 end
 
+function CloUtil.stop_combat_fov_tween(reason)
+    local cf = CloUtil.combat_fov
+    cf.generation = cf.generation + 1
+    cf.poll_active = false
+    cf.direction = nil
+    cf.paused = false
+    cf.from_by_address = {}
+    cf.last_manager_fov = nil
+    if config.EnableLog and reason ~= nil then
+        append_log("COMBAT FOV TWEEN STOP | Reason=" .. tostring(reason))
+    end
+end
+
+function CloUtil.combat_fov_smooth_t(t)
+    if t <= 0 then return 0 end
+    if t >= 1 then return 1 end
+    return t * t * (3.0 - 2.0 * t)
+end
+
+function CloUtil.iter_combat_fov_stack_modes(visitor)
+    local camera = tracked_camera
+    if not valid_object(camera) then
+        camera = camera_from_combat(tracked_combat)
+    end
+    if not valid_object(camera) then
+        local combat = find_combat_component()
+        camera = camera_from_combat(combat)
+    end
+    if not valid_object(camera) then
+        return 0
+    end
+
+    local stack = get_field(camera, "CameraModeStack")
+    if stack == nil then
+        return 0
+    end
+
+    local depth = 0
+    pcall(function()
+        depth = stack:GetArrayNum()
+    end)
+    if type(depth) ~= "number" or depth <= 0 then
+        return 0
+    end
+
+    local count = 0
+    for index = 1, depth do
+        local mode = nil
+        pcall(function()
+            local entry = stack[index]
+            if entry ~= nil then
+                mode = entry.CameraMode
+            end
+        end)
+        if valid_object(mode) and
+            not is_ability_mode(mode) and
+            not CloUtil.is_transient_overlay_mode(mode) then
+            cache_mode(mode)
+            local address = object_address(mode)
+            if visitor(mode, address, index) then
+                count = count + 1
+            end
+        end
+    end
+
+    return count
+end
+
+function CloUtil.read_manager_fov()
+    local _, manager = get_player_camera_manager()
+    if not valid_object(manager) then
+        return nil
+    end
+    local value = nil
+    pcall(function()
+        value = manager:GetFOVAngle()
+    end)
+    return tonumber(value)
+end
+
+function CloUtil.set_manager_fov(target_fov, reason, force)
+    if type(target_fov) ~= "number" then
+        return false
+    end
+    if CloUtil.stack_overlay.active or CloUtil.combat_fov.paused then
+        return false
+    end
+
+    local cf = CloUtil.combat_fov
+    if not force and cf.last_manager_fov ~= nil and
+        math.abs(cf.last_manager_fov - target_fov) < 0.05 then
+        return true
+    end
+
+    local _, manager = get_player_camera_manager()
+    if not valid_object(manager) then
+        return false
+    end
+
+    local ok = false
+    pcall(function()
+        manager:SetFOVAngle(target_fov)
+        ok = true
+    end)
+
+    if ok then
+        cf.last_manager_fov = target_fov
+        if config.EnableLog and reason ~= nil and
+            reason ~= "CombatPoll" and
+            reason ~= "StackPoll" then
+            append_log(
+                "COMBAT MANAGER FOV" ..
+                " | Reason=" .. tostring(reason) ..
+                " | Target=" .. tostring(target_fov)
+            )
+        end
+    end
+
+    return ok
+end
+
+function CloUtil.write_manager_cache_pov_fov(manager, cache_field, target_fov)
+    if not valid_object(manager) or type(target_fov) ~= "number" then
+        return false
+    end
+
+    local cache = get_unwrapped_field(manager, cache_field)
+    local pov = get_unwrapped_field(cache, "POV")
+    if pov == nil then
+        return false
+    end
+
+    return set_field(pov, "FOV", target_fov)
+end
+
+function CloUtil.publish_combat_fov_to_view(target_fov, reason, force)
+    if type(target_fov) ~= "number" then
+        return ""
+    end
+    if not force and
+        (CloUtil.stack_overlay.active or CloUtil.combat_fov.paused) then
+        return ""
+    end
+
+    local channels = {}
+    local _, manager = get_player_camera_manager()
+    if valid_object(manager) then
+        if CloUtil.write_manager_cache_pov_fov(manager, "CameraCachePrivate", target_fov) then
+            channels[#channels + 1] = "CameraCachePrivate"
+        end
+        if CloUtil.write_manager_cache_pov_fov(manager, "LastFrameCameraCachePrivate", target_fov) then
+            channels[#channels + 1] = "LastFrameCameraCachePrivate"
+        end
+
+        local view_target = get_field(manager, "ViewTarget")
+        local view_pov = get_unwrapped_field(view_target, "POV")
+        if view_pov ~= nil and set_field(view_pov, "FOV", target_fov) then
+            channels[#channels + 1] = "ViewTarget.POV"
+        end
+
+        pcall(function()
+            if manager.SetFOV ~= nil then
+                manager:SetFOV(target_fov)
+                channels[#channels + 1] = "SetFOV"
+            end
+        end)
+    end
+
+    local camera = tracked_camera
+    if not valid_object(camera) then
+        camera = camera_from_combat(tracked_combat)
+    end
+    if not valid_object(camera) then
+        local combat = find_combat_component()
+        camera = camera_from_combat(combat)
+    end
+
+    if valid_object(camera) then
+        for _, field_name in ipairs({ "FieldOfView", "CurrentFOV", "DefaultFOV" }) do
+            if set_field(camera, field_name, target_fov) then
+                channels[#channels + 1] = "FollowCamera." .. field_name
+            end
+        end
+    end
+
+    if config.EnableLog and reason ~= nil and #channels > 0 and
+        reason ~= "CombatPoll" and reason ~= "StackPoll" then
+        append_log(
+            "COMBAT FOV VIEW PUBLISH" ..
+            " | Reason=" .. tostring(reason) ..
+            " | Target=" .. tostring(target_fov) ..
+            " | Channels=" .. table.concat(channels, ",")
+        )
+    end
+
+    return table.concat(channels, ",")
+end
+
+function CloUtil.schedule_combat_fov_arm_confirm(reason)
+    return
+end
+
+function CloUtil.seed_stack_modes_full_fov(target_fov, reason)
+    if type(target_fov) ~= "number" then
+        return 0
+    end
+
+    local wrote = CloUtil.apply_combat_fov_to_stack(target_fov, reason)
+
+    for _, saved in pairs(saved_modes) do
+        local mode = saved.mode
+        if valid_object(mode) and
+            not is_ability_mode(mode) and
+            not CloUtil.is_transient_overlay_mode(mode) then
+            cache_mode(mode)
+            if set_field(mode, "DefaultFieldOfView", target_fov) then
+                wrote = wrote + 1
+            end
+        end
+    end
+
+    local camera = tracked_camera
+    if not valid_object(camera) then
+        camera = camera_from_combat(tracked_combat)
+    end
+    if not valid_object(camera) then
+        camera = camera_from_combat(find_combat_component())
+    end
+
+    if valid_object(camera) then
+        local stack = get_field(camera, "CameraModeStack")
+        if stack ~= nil then
+            local depth = 0
+            pcall(function()
+                depth = stack:GetArrayNum()
+            end)
+            for index = 1, depth do
+                local mode = nil
+                pcall(function()
+                    local entry = stack[index]
+                    if entry ~= nil then
+                        mode = entry.CameraMode
+                    end
+                end)
+                if valid_object(mode) and
+                    not is_ability_mode(mode) and
+                    not CloUtil.is_transient_overlay_mode(mode) then
+                    cache_mode(mode)
+                    if set_field(mode, "DefaultFieldOfView", target_fov) then
+                        wrote = wrote + 1
+                    end
+                end
+            end
+        end
+    end
+
+    return wrote
+end
+
+function CloUtil.read_live_view_fov()
+    local manager_fov = CloUtil.read_manager_fov()
+    local cache_fov = nil
+    local _, manager = get_player_camera_manager()
+    if valid_object(manager) then
+        local cache = get_unwrapped_field(manager, "CameraCachePrivate")
+        local pov = get_unwrapped_field(cache, "POV")
+        cache_fov = tonumber(get_unwrapped_field(pov, "FOV"))
+    end
+    return manager_fov, cache_fov
+end
+
+function CloUtil.capture_restore_view_fov(reason)
+    local cf = CloUtil.combat_fov
+    if type(cf.restore_view_fov) == "number" then
+        return cf.restore_view_fov
+    end
+
+    local combat_target = tonumber(config.LockOnFOV) or 110.0
+    local manager_fov, cache_fov = CloUtil.read_live_view_fov()
+    local candidate = nil
+
+    if type(manager_fov) == "number" and
+        math.abs(manager_fov - combat_target) > 0.05 then
+        candidate = manager_fov
+    elseif type(cache_fov) == "number" and
+        math.abs(cache_fov - combat_target) > 0.05 then
+        candidate = cache_fov
+    end
+
+    if candidate == nil then
+        CloUtil.iter_combat_fov_stack_modes(function(mode, address)
+            if candidate ~= nil then
+                return true
+            end
+            local base = baseline_fov(mode)
+            if type(base) == "number" and
+                math.abs(base - combat_target) > 0.05 then
+                candidate = base
+            elseif saved_modes[address] ~= nil and
+                type(saved_modes[address].fov) == "number" and
+                math.abs(saved_modes[address].fov - combat_target) > 0.05 then
+                candidate = saved_modes[address].fov
+            end
+            return true
+        end)
+    end
+
+    if candidate == nil then
+        local last_mode = nil
+        CloUtil.iter_combat_fov_stack_modes(function(mode)
+            if valid_object(mode) then
+                last_mode = mode
+            end
+            return true
+        end)
+        if valid_object(last_mode) then
+            candidate = CloUtil.unlock_baseline_fov(last_mode)
+        end
+    end
+
+    cf.restore_view_fov = candidate or 90.0
+
+    if config.EnableLog then
+        append_log(
+            "COMBAT FOV RESTORE CAPTURE" ..
+            " | Reason=" .. tostring(reason) ..
+            " | ManagerFOV=" .. tostring(manager_fov) ..
+            " | CacheFOV=" .. tostring(cache_fov) ..
+            " | RestoreFOV=" .. tostring(cf.restore_view_fov)
+        )
+    end
+
+    return cf.restore_view_fov
+end
+
+function CloUtil.get_restore_view_fov()
+    local cf = CloUtil.combat_fov
+    if type(cf.restore_view_fov) == "number" then
+        return cf.restore_view_fov
+    end
+
+    local combat_target = tonumber(config.LockOnFOV) or 110.0
+    for _, saved in pairs(saved_modes) do
+        if type(saved.fov) == "number" and
+            math.abs(saved.fov - combat_target) > 0.05 then
+            return saved.fov
+        end
+    end
+
+    return 90.0
+end
+
+function CloUtil.arm_combat_fov(reason)
+    if not mod_enabled or not config.FOVEnabled or not CloUtil.in_combat_context() then
+        return false
+    end
+    if CloUtil.combat_fov.sheath_abort_rearm_pending and
+        reason ~= "SheathAbortRedraw" then
+        return false
+    end
+
+    CloUtil.capture_restore_view_fov(reason)
+
+    local target = tonumber(config.LockOnFOV) or 110.0
+    CloUtil.stop_combat_fov_tween(reason)
+
+    pcall(function()
+        CloUtil.warm_combat_fov_cache(reason)
+    end)
+    pcall(function()
+        CloUtil.combat_fov_capture_from_values()
+    end)
+
+    local stack_wrote = CloUtil.seed_stack_modes_full_fov(target, reason)
+    local apply_ok, apply_err = pcall(function()
+        CloUtil.apply_fov_to_active_stack_top(target, reason)
+    end)
+    if not apply_ok and config.EnableLog then
+        append_log(
+            "COMBAT STACK TOP FOV ERROR" ..
+            " | Reason=" .. tostring(reason) ..
+            " | Error=" .. tostring(apply_err)
+        )
+    end
+    local view_channels = CloUtil.publish_combat_fov_to_view(target, reason, true)
+    local live_pov = CloUtil.read_manager_fov()
+    local cache_pov = nil
+    local _, manager = get_player_camera_manager()
+    if valid_object(manager) then
+        local cache = get_unwrapped_field(manager, "CameraCachePrivate")
+        local pov = get_unwrapped_field(cache, "POV")
+        cache_pov = tonumber(get_unwrapped_field(pov, "FOV"))
+    end
+
+    fov_applied = true
+    CloUtil.combat_fov.direction = nil
+    CloUtil.combat_fov.poll_active = false
+    CloUtil.combat_fov.last_view_publish_ms = os.clock() * 1000.0
+
+    if config.EnableLog then
+        append_log(
+            "COMBAT FOV ARM" ..
+            " | Reason=" .. tostring(reason) ..
+            " | Target=" .. tostring(target) ..
+            " | StackWrote=" .. tostring(stack_wrote) ..
+            " | ViewChannels=" .. tostring(view_channels) ..
+            " | ManagerFOV=" .. tostring(live_pov) ..
+            " | CachePOV=" .. tostring(cache_pov) ..
+            " | LockActive=" .. tostring(lock_active)
+        )
+    end
+
+    CloUtil.pulse_unlocked_camera_type_for_fov(reason)
+
+    local sanity_fov = CloUtil.read_manager_fov()
+    if type(sanity_fov) == "number" and sanity_fov < 50.0 then
+        local restore_fov = CloUtil.get_restore_view_fov()
+        if type(restore_fov) == "number" then
+            CloUtil.publish_combat_fov_to_view(restore_fov, "ArmSanityFail", true)
+            CloUtil.set_manager_fov(restore_fov, "ArmSanityFail", true)
+        end
+        if valid_object(camera_from_combat(tracked_combat)) then
+            pcall(function()
+                camera_from_combat(tracked_combat):SetCameraType(CAMERA_TYPE_DEFAULT)
+            end)
+        end
+        fov_applied = false
+        CloUtil.combat_fov.fov_type_pulse_done = false
+        if config.EnableLog then
+            append_log(
+                "COMBAT FOV ARM SANITY FAIL" ..
+                " | Reason=" .. tostring(reason) ..
+                " | ManagerFOV=" .. tostring(sanity_fov) ..
+                " | RestoreFOV=" .. tostring(restore_fov)
+            )
+        end
+        return false
+    end
+
+    return true
+end
+
+function CloUtil.reassert_event_bypasses_cooldown(reason)
+    local text = tostring(reason)
+    return text == "TargetSwap" or
+        text == "TargetSwapAfterDeath" or
+        text == "OverlayRecovery" or
+        text:find("TargetSwap", 1, true) ~= nil or
+        text:find("OverlayRecovery", 1, true) ~= nil
+end
+
+function CloUtil.refresh_combat_fov_view(reason, force)
+    if not mod_enabled or not config.FOVEnabled or not CloUtil.in_combat_context() then
+        return false
+    end
+
+    local target = tonumber(config.LockOnFOV) or 110.0
+    local cf = CloUtil.combat_fov
+    local now_ms = os.clock() * 1000.0
+    CloUtil.publish_combat_fov_to_view(target, reason, force == true)
+    cf.last_view_publish_ms = now_ms
+    fov_applied = true
+    return true
+end
+
+function CloUtil.reassert_combat_fov(reason, urgent)
+    if not mod_enabled or not config.FOVEnabled or not CloUtil.in_combat_context() then
+        return false
+    end
+
+    local cf = CloUtil.combat_fov
+    local now_ms = os.clock() * 1000.0
+    local bypass = CloUtil.reassert_event_bypasses_cooldown(reason)
+    local cooldown = cf.reassert_cooldown_ms or 800
+    if not bypass and cf.last_reassert_ms ~= nil and
+        now_ms - cf.last_reassert_ms < cooldown then
+        return false
+    end
+
+    local target = tonumber(config.LockOnFOV) or 110.0
+    local stack_wrote = CloUtil.seed_stack_modes_full_fov(target, reason)
+    local view_channels = CloUtil.publish_combat_fov_to_view(
+        target,
+        reason,
+        urgent == true
+    )
+    cf.last_stack_push_ms = now_ms
+    cf.last_view_publish_ms = now_ms
+    cf.last_reassert_ms = now_ms
+    fov_applied = true
+
+    if config.EnableLog then
+        append_log(
+            "COMBAT FOV REASSERT" ..
+            " | Reason=" .. tostring(reason) ..
+            " | Urgent=" .. tostring(urgent == true) ..
+            " | Target=" .. tostring(target) ..
+            " | StackWrote=" .. tostring(stack_wrote) ..
+            " | ViewChannels=" .. tostring(view_channels) ..
+            " | ManagerFOV=" .. tostring(CloUtil.read_manager_fov())
+        )
+    end
+
+    return true
+end
+
+function CloUtil.schedule_combat_fov_reassert(reason)
+    if not CloUtil.in_combat_context() or not config.FOVEnabled or
+        type(ExecuteWithDelay) ~= "function" or
+        type(ExecuteInGameThread) ~= "function" then
+        return
+    end
+
+    local generation = runtime_generation
+    for _, delay_ms in ipairs({ 0, 300 }) do
+        ExecuteWithDelay(delay_ms, function()
+            if generation ~= runtime_generation then
+                return
+            end
+
+            ExecuteInGameThread(function()
+                if generation ~= runtime_generation or
+                    not CloUtil.in_combat_context() or
+                    not mod_enabled or
+                    not config.FOVEnabled then
+                    return
+                end
+
+                CloUtil.reassert_combat_fov(
+                    tostring(reason) .. "@T+" .. tostring(delay_ms),
+                    true
+                )
+            end)
+        end)
+    end
+end
+
+function CloUtil.apply_combat_fov_to_stack(target_fov, reason)
+    if type(target_fov) ~= "number" then
+        return 0
+    end
+
+    local wrote = 0
+    CloUtil.iter_combat_fov_stack_modes(function(mode, address)
+        if set_field(mode, "DefaultFieldOfView", target_fov) then
+            wrote = wrote + 1
+        end
+        return true
+    end)
+
+    if wrote > 0 and reason ~= nil and config.EnableLog then
+        append_log(
+            "COMBAT STACK FOV" ..
+            " | Reason=" .. tostring(reason) ..
+            " | Target=" .. tostring(target_fov) ..
+            " | Wrote=" .. tostring(wrote)
+        )
+    end
+
+    return wrote
+end
+
+function CloUtil.maintain_combat_fov(reason)
+    if not mod_enabled or not config.FOVEnabled then
+        return 0
+    end
+    if not CloUtil.in_combat_context() then
+        return 0
+    end
+    if CloUtil.is_defensive_combat_state() then
+        return 0
+    end
+    if CloUtil.stack_overlay.active or CloUtil.combat_fov.paused then
+        return 0
+    end
+
+    local cf = CloUtil.combat_fov
+    if cf.sheath_abort_rearm_pending then
+        return 0
+    end
+    local in_combat_fov = fov_applied or cf.poll_active or cf.direction == "in"
+    if not in_combat_fov then
+        return 0
+    end
+
+    local target = tonumber(config.LockOnFOV) or 110.0
+    local now_ms = os.clock() * 1000.0
+    local wrote = 0
+
+    if fov_applied then
+        local stack_interval = cf.stack_push_interval_ms or 300
+        local view_interval = cf.view_publish_interval_ms or 200
+        if cf.last_stack_push_ms == nil or
+            now_ms - cf.last_stack_push_ms >= stack_interval then
+            wrote = CloUtil.apply_combat_fov_to_stack(target, nil)
+            cf.last_stack_push_ms = now_ms
+        end
+        if cf.last_view_publish_ms == nil or
+            now_ms - cf.last_view_publish_ms >= view_interval or
+            reason == "TargetSwap" or
+            reason == "TargetSwapAfterDeath" or
+            reason == "OverlayRecovery" then
+            CloUtil.publish_combat_fov_to_view(target, reason, false)
+            cf.last_view_publish_ms = now_ms
+        end
+    end
+
+    return wrote
+end
+
+function CloUtil.combat_fov_capture_from_values()
+    local cf = CloUtil.combat_fov
+    cf.from_by_address = {}
+    CloUtil.iter_combat_fov_stack_modes(function(mode, address)
+        if address == nil then
+            return true
+        end
+        local current = baseline_fov(mode)
+        if current == nil and saved_modes[address] ~= nil then
+            current = saved_modes[address].fov
+        end
+        if type(current) == "number" then
+            cf.from_by_address[address] = current
+        end
+        return true
+    end)
+end
+
+function CloUtil.combat_fov_tick()
+    local cf = CloUtil.combat_fov
+    local direction = cf.direction
+    if direction == nil then
+        return true
+    end
+    if cf.paused or CloUtil.stack_overlay.active then
+        return false
+    end
+
+    local elapsed = (os.clock() * 1000.0) - cf.start_ms
+    local raw_t = math.min(1.0, elapsed / cf.duration_ms)
+    local t = CloUtil.combat_fov_smooth_t(raw_t)
+    local target_lock = tonumber(config.LockOnFOV) or 110.0
+    local all_done = true
+    local wrote = 0
+    local manager_fov = nil
+
+    CloUtil.iter_combat_fov_stack_modes(function(mode, address)
+        if address == nil then
+            return true
+        end
+
+        if cf.from_by_address[address] == nil then
+            local current = baseline_fov(mode)
+            if current == nil and saved_modes[address] ~= nil then
+                current = saved_modes[address].fov
+            end
+            if type(current) == "number" then
+                cf.from_by_address[address] = current
+            end
+        end
+
+        local from_fov = cf.from_by_address[address]
+        if type(from_fov) ~= "number" then
+            return true
+        end
+
+        local to_fov = from_fov
+        if direction == "in" then
+            to_fov = target_lock
+        elseif direction == "out" then
+            to_fov = CloUtil.get_restore_view_fov()
+        elseif saved_modes[address] ~= nil and saved_modes[address].fov ~= nil then
+            to_fov = saved_modes[address].fov
+        end
+
+        local new_fov = from_fov + (to_fov - from_fov) * t
+        if set_field(mode, "DefaultFieldOfView", new_fov) then
+            wrote = wrote + 1
+        end
+        if math.abs(new_fov - to_fov) > 0.25 then
+            all_done = false
+        end
+        if manager_fov == nil then
+            manager_fov = new_fov
+        end
+        return true
+    end)
+
+    if manager_fov ~= nil then
+        CloUtil.set_manager_fov(manager_fov, "CombatFovTween")
+    end
+
+    if raw_t >= 1.0 then
+        all_done = true
+    end
+
+    if all_done then
+        fov_applied = direction == "in"
+        cf.direction = nil
+        cf.poll_active = false
+        if direction == "in" and manager_fov ~= nil then
+            CloUtil.set_manager_fov(target_lock, "CombatFovTweenDone")
+        elseif direction == "out" then
+            cf.last_manager_fov = nil
+            local restore_fov = CloUtil.get_restore_view_fov()
+            if type(restore_fov) == "number" then
+                CloUtil.publish_combat_fov_to_view(
+                    restore_fov,
+                    "CombatExitViewRestore",
+                    true
+                )
+                CloUtil.set_manager_fov(
+                    restore_fov,
+                    "CombatExitViewRestore",
+                    true
+                )
+            end
+            pcall(restore_mode_defaults)
+            cf.restore_view_fov = nil
+        end
+        if config.EnableLog then
+            append_log(
+                "COMBAT FOV TWEEN DONE" ..
+                " | Direction=" .. tostring(direction) ..
+                " | Wrote=" .. tostring(wrote) ..
+                " | FOVApplied=" .. tostring(fov_applied) ..
+                " | ManagerFOV=" .. tostring(manager_fov)
+            )
+        end
+    end
+
+    return all_done
+end
+
+function CloUtil.combat_fov_poll(generation)
+    if generation ~= CloUtil.combat_fov.generation or not CloUtil.combat_fov.poll_active then
+        return
+    end
+    if type(ExecuteInGameThread) ~= "function" or type(ExecuteWithDelay) ~= "function" then
+        return
+    end
+
+    ExecuteInGameThread(function()
+        if generation ~= CloUtil.combat_fov.generation or not CloUtil.combat_fov.poll_active then
+            return
+        end
+
+        local done = CloUtil.combat_fov_tick()
+        if done then
+            return
+        end
+
+        ExecuteWithDelay(CloUtil.combat_fov.tick_ms, function()
+            CloUtil.combat_fov_poll(generation)
+        end)
+    end)
+end
+
+function CloUtil.warm_combat_fov_cache(reason)
+    pcall(rebuild_mode_cache)
+
+    local camera = tracked_camera
+    if not valid_object(camera) then
+        camera = camera_from_combat(tracked_combat)
+    end
+    if not valid_object(camera) then
+        local combat = find_combat_component()
+        camera = camera_from_combat(combat)
+    end
+    if not valid_object(camera) then
+        return 0
+    end
+
+    local stack = get_field(camera, "CameraModeStack")
+    if stack == nil then
+        return 0
+    end
+
+    local depth = 0
+    pcall(function()
+        depth = stack:GetArrayNum()
+    end)
+    if type(depth) ~= "number" or depth <= 0 then
+        return 0
+    end
+
+    local cached = 0
+    for index = 1, depth do
+        local mode = nil
+        pcall(function()
+            local entry = stack[index]
+            if entry ~= nil then
+                mode = entry.CameraMode
+            end
+        end)
+        if valid_object(mode) then
+            cache_mode(mode)
+            cached = cached + 1
+        end
+    end
+
+    if config.EnableLog and cached > 0 then
+        append_log(
+            "COMBAT FOV CACHE WARM" ..
+            " | Reason=" .. tostring(reason) ..
+            " | StackModes=" .. tostring(cached)
+        )
+    end
+
+    return cached
+end
+
+function CloUtil.start_combat_fov_tween(direction, reason)
+    if not config.FOVEnabled then
+        return false
+    end
+    if not mod_enabled then
+        if direction == "in" and CloUtil.in_combat_context() then
+            CloUtil.combat_fov.pending_enter = true
+            if config.EnableLog then
+                append_log(
+                    "COMBAT FOV PENDING | Reason=" .. tostring(reason) ..
+                    " | ModEnabled=false"
+                )
+            end
+        end
+        return false
+    end
+    if direction ~= "in" and direction ~= "out" then
+        return false
+    end
+
+    local cf = CloUtil.combat_fov
+    if direction == "in" then
+        if CloUtil.in_combat_context() then
+            return CloUtil.arm_combat_fov(reason or "TweenIn")
+        end
+        if fov_applied or cf.poll_active then
+            if config.EnableLog then
+                append_log(
+                    "COMBAT FOV TWEEN SKIP" ..
+                    " | Reason=" .. tostring(reason) ..
+                    " | FOVApplied=" .. tostring(fov_applied) ..
+                    " | PollActive=" .. tostring(cf.poll_active)
+                )
+            end
+            return true
+        end
+    end
+
+    CloUtil.combat_fov.pending_enter = false
+    pcall(function()
+        CloUtil.warm_combat_fov_cache(reason)
+    end)
+
+    CloUtil.stop_combat_fov_tween("restart+" .. tostring(reason))
+
+    cf.generation = cf.generation + 1
+    local generation = cf.generation
+    cf.direction = direction
+    cf.start_ms = os.clock() * 1000.0
+    cf.paused = false
+    cf.poll_active = false
+
+    local capture_ok, capture_err = pcall(function()
+        CloUtil.combat_fov_capture_from_values()
+    end)
+    if not capture_ok then
+        cf.direction = nil
+        if CloUtil.in_combat_context() then
+            return CloUtil.arm_combat_fov("CaptureFallback+" .. tostring(reason))
+        end
+        local target = tonumber(config.LockOnFOV) or 110.0
+        CloUtil.seed_stack_modes_full_fov(target, reason)
+        CloUtil.publish_combat_fov_to_view(target, "CaptureFallback+" .. tostring(reason))
+        fov_applied = true
+        if config.EnableLog then
+            append_log(
+                "COMBAT FOV CAPTURE FALLBACK" ..
+                " | Reason=" .. tostring(reason) ..
+                " | Error=" .. tostring(capture_err) ..
+                " | Target=" .. tostring(target)
+            )
+        end
+        return true
+    end
+
+    cf.poll_active = true
+
+    local pov_before = CloUtil.read_manager_fov()
+
+    if config.EnableLog then
+        append_log(
+            "COMBAT FOV TWEEN START" ..
+            " | Direction=" .. tostring(direction) ..
+            " | Reason=" .. tostring(reason) ..
+            " | TargetFOV=" .. tostring(config.LockOnFOV) ..
+            " | DurationMs=" .. tostring(cf.duration_ms) ..
+            " | ManagerFOVBefore=" .. tostring(pov_before)
+        )
+    end
+
+    CloUtil.combat_fov_tick()
+
+    if config.EnableLog then
+        append_log(
+            "COMBAT FOV POV PUSH" ..
+            " | Reason=" .. tostring(reason) ..
+            " | ManagerFOVBefore=" .. tostring(pov_before) ..
+            " | ManagerFOVAfter=" .. tostring(CloUtil.read_manager_fov()) ..
+            " | PollActive=" .. tostring(cf.poll_active)
+        )
+    end
+
+    if cf.poll_active then
+        CloUtil.combat_fov_poll(generation)
+    end
+    return true
+end
+
+function CloUtil.apply_combat_fov_to_mode(mode, reason)
+    if not mod_enabled or not config.FOVEnabled or not valid_object(mode) then
+        return false
+    end
+    if is_ability_mode(mode) or CloUtil.is_transient_overlay_mode(mode) then
+        return false
+    end
+    if not fov_applied and CloUtil.combat_fov.direction ~= "in" then
+        return false
+    end
+
+    cache_mode(mode)
+    local target = tonumber(config.LockOnFOV)
+    if target == nil then
+        return false
+    end
+
+    if CloUtil.combat_fov.direction == "in" then
+        local address = object_address(mode)
+        local cf = CloUtil.combat_fov
+        if address ~= nil and cf.from_by_address[address] == nil then
+            local current = baseline_fov(mode)
+            cf.from_by_address[address] = current or target
+        end
+        local elapsed = (os.clock() * 1000.0) - cf.start_ms
+        local raw_t = math.min(1.0, elapsed / cf.duration_ms)
+        local t = CloUtil.combat_fov_smooth_t(raw_t)
+        local from_fov = address and cf.from_by_address[address]
+        if type(from_fov) == "number" then
+            target = from_fov + (target - from_fov) * t
+        end
+    end
+
+    return set_field(mode, "DefaultFieldOfView", target)
+end
+
 local function restore_mode_defaults()
     for address, saved in pairs(saved_modes) do
         if valid_object(saved.mode) and saved.fov ~= nil then
@@ -730,64 +1951,6 @@ local function readable_runtime_value(value)
     return tostring(value)
 end
 
-local function object_address(object)
-    if object == nil then
-        return nil
-    end
-
-    local ok, address = pcall(function()
-        return object:GetAddress()
-    end)
-
-    if ok and address ~= nil then
-        return tostring(address)
-    end
-
-    return nil
-end
-
-local function find_combat_component()
-    if valid_object(combat_component) then
-        return combat_component
-    end
-
-    if tracked_combat ~= nil and valid_object(tracked_combat) then
-        combat_component = tracked_combat
-        return combat_component
-    end
-
-    if type(FindAllOf) ~= "function" then
-        return nil
-    end
-
-    local ok, objects = pcall(function()
-        return FindAllOf(COMBAT_COMPONENT_CLASS)
-    end)
-
-    if not ok or objects == nil then
-        return nil
-    end
-
-    local best = nil
-    local best_mode = -1
-    for _, object in ipairs(objects) do
-        if valid_object(object) then
-            local mode_raw = unwrap_value(get_field(object, "CurrentCombatMode"))
-            local mode = tonumber(mode_raw) or 0
-            if mode > best_mode then
-                best_mode = mode
-                best = object
-            end
-        end
-    end
-
-    if best ~= nil then
-        combat_component = best
-    end
-
-    return best
-end
-
 local function set_combat_component(component, reason)
     if not valid_object(component) then
         return false
@@ -802,6 +1965,8 @@ local function set_combat_component(component, reason)
 
     local old_name = combat_component and safe_full_name(combat_component) or "<nil>"
     combat_component = component
+    combat_mode_last = nil
+    combat_state_last = nil
 
     append_log(
         "COMBAT COMPONENT CHANGED | Reason=" .. tostring(reason) ..
@@ -817,8 +1982,14 @@ end
 local function sample_combat_state()
     local component = find_combat_component()
     if component == nil then
+        local cf = CloUtil.combat_fov
+        if config.EnableLog and not cf.resolve_miss_logged then
+            cf.resolve_miss_logged = true
+            append_log("COMBAT COMPONENT MISSING | CombatPollSkipped")
+        end
         return
     end
+    CloUtil.combat_fov.resolve_miss_logged = false
 
     if not combat_component_name_logged then
         append_log(
@@ -829,59 +2000,100 @@ local function sample_combat_state()
     end
 
     local state_text = readable_runtime_value(get_field(component, "CurrentState"))
+    CloUtil.combat_fov.last_state = tonumber(state_text)
     local mode_value = unwrap_value(get_field(component, "CurrentCombatMode"))
     local mode_text = readable_runtime_value(mode_value)
     local mode_number = tonumber(mode_value)
 
+    local cf = CloUtil.combat_fov
     local previous_mode_number = combat_mode_last
+    local effective_mode = mode_number
+    local now_ms = os.clock() * 1000.0
+    local confirm_ms = cf.exit_confirm_ms or 2000
+    local held_ms = 0
+    local sheath_abort_handled = false
 
-    if (previous_mode_number == nil or previous_mode_number == 0) and
-        mode_number ~= nil and mode_number ~= 0 then
+    -- Enemy death can set CurrentCombatMode=0 while still in a fight.
+    -- Require a wall-clock hold so two polls in the same second cannot burn debounce.
+    if mode_number == 0 and previous_mode_number ~= nil and previous_mode_number ~= 0 then
+        if cf.exit_zero_since_ms == nil then
+            cf.exit_zero_since_ms = now_ms
+            if config.EnableLog then
+                append_log(
+                    "COMBAT MODE FLICKER" ..
+                    " | State=" .. tostring(state_text) ..
+                    " | HeldMode=" .. tostring(previous_mode_number) ..
+                    " | ConfirmMs=" .. tostring(confirm_ms)
+                )
+            end
+        end
+        held_ms = now_ms - cf.exit_zero_since_ms
+        if held_ms < confirm_ms then
+            effective_mode = previous_mode_number
+        end
+    else
+        if cf.exit_zero_since_ms ~= nil and
+            mode_number ~= nil and mode_number ~= 0 and
+            cf.session_active and not lock_active then
+            if config.EnableLog then
+                append_log(
+                    "COMBAT SHEATH ABORT REDRAW" ..
+                    " | Mode=" .. tostring(mode_number) ..
+                    " | FOVApplied=" .. tostring(fov_applied)
+                )
+            end
+            CloUtil.handle_sheath_abort_redraw()
+            sheath_abort_handled = true
+        end
+        cf.exit_zero_since_ms = nil
+        cf.exit_pending = 0
+        held_ms = 0
+    end
+
+    if effective_mode ~= nil and effective_mode ~= 0 and not cf.session_active then
         append_log(
             "COMBAT ENTER DETECTED | PreviousCombatMode=" ..
             tostring(previous_mode_number) ..
-            " | CurrentCombatMode=" .. tostring(mode_number)
+            " | CurrentCombatMode=" .. tostring(effective_mode) ..
+            " | LockActive=" .. tostring(lock_active)
         )
-        CloUtil.apply_combat_offset_z("CombatEnter")
-        if mod_enabled and config.CameraOffsetFix then
-            apply_combat_offset_fix(COMBAT_OFFSET_FIX_Y, "CombatEnter")
+        CloUtil.begin_combat_session(component, "CombatEnter", true)
+    elseif not sheath_abort_handled and
+        effective_mode ~= nil and effective_mode ~= 0 and
+        cf.session_active and mod_enabled and config.FOVEnabled and
+        not cf.sheath_abort_rearm_pending and
+        not fov_applied and not cf.poll_active then
+        local last_ms = cf.last_catchup_ms
+        if last_ms == nil or (now_ms - last_ms) >= (cf.catchup_cooldown_ms or 2000) then
+            cf.last_catchup_ms = now_ms
+            CloUtil.bootstrap_combat_fov("CombatEnterCatchup")
         end
+    elseif not sheath_abort_handled and
+        cf.session_active and mod_enabled and config.FOVEnabled and
+        not cf.sheath_abort_rearm_pending and
+        not fov_applied and not cf.poll_active then
+        CloUtil.bootstrap_combat_fov("CombatPoll")
     end
 
     if previous_mode_number ~= nil and
         previous_mode_number ~= 0 and
-        mode_number == 0 then
+        mode_number == 0 and
+        held_ms >= confirm_ms and
+        cf.session_active then
+
+        combat_mode_last = 0
 
         append_log(
             "COMBAT EXIT DETECTED | PreviousCombatMode=" ..
             tostring(previous_mode_number) ..
             " | CurrentCombatMode=0" ..
+            " | HeldMs=" .. tostring(math.floor(held_ms)) ..
             " | LockActive=" .. tostring(lock_active) ..
             " | FOVApplied=" .. tostring(fov_applied) ..
             " | SavedCameraType=" .. tostring(previous_camera_type)
         )
 
-        CloUtil.restore_combat_offset_z("CombatExit")
-        if mod_enabled and config.CameraOffsetFix then
-            apply_combat_offset_fix(COMBAT_OFFSET_DEFAULT_Y, "CombatExit")
-        end
-
-        if lock_active then
-            local ok, err = pcall(function()
-                apply_lock_fov(component, false)
-            end)
-
-            append_log(
-                "COMBAT EXIT CLEANUP | PCallOK=" .. tostring(ok) ..
-                " | Error=" .. tostring(err) ..
-                " | LockActiveAfter=" .. tostring(lock_active) ..
-                " | FOVAppliedAfter=" .. tostring(fov_applied)
-            )
-        else
-            append_log(
-                "COMBAT EXIT CLEANUP | No active Lock-On session"
-            )
-        end
+        CloUtil.end_combat_session(component, "CombatExit")
     end
 
     if combat_state_last == nil or state_text ~= combat_state_last then
@@ -890,23 +2102,43 @@ local function sample_combat_state()
             " | CurrentCombatMode=" .. mode_text
         )
         combat_state_last = state_text
-    elseif mode_number ~= nil and
-        (combat_mode_last == nil or mode_number ~= combat_mode_last) then
+    elseif effective_mode ~= nil and
+        (combat_mode_last == nil or effective_mode ~= combat_mode_last) then
         append_log(
             "COMBAT MODE CHANGED | CurrentState=" .. state_text ..
             " | CurrentCombatMode=" .. mode_text
         )
     end
 
-    if mode_number ~= nil then
-        combat_mode_last = mode_number
+    if effective_mode ~= nil then
+        combat_mode_last = effective_mode
+    elseif mode_number == 0 and held_ms >= confirm_ms then
+        combat_mode_last = 0
     end
 
-    if mod_enabled and
-        (lock_active or fov_applied or
-            (mode_number ~= nil and mode_number ~= 0)) then
-        CloUtil.log_tracked_vitality_if_due()
-        CloUtil.sync_lock_with_game("CombatPoll")
+    if cf.session_active and mod_enabled then
+        if cf.lock_writes_deferred and lock_active and
+            not CloUtil.is_defensive_combat_state() then
+            CloUtil.apply_deferred_lock_writes("CombatPoll")
+        end
+        if not cf.sheath_abort_rearm_pending and
+            cf.fov_type_pulse_pending and not lock_active then
+            CloUtil.pulse_unlocked_camera_type_for_fov("CombatPoll")
+        end
+        if config.FOVEnabled and not cf.sheath_abort_rearm_pending then
+            CloUtil.maintain_combat_fov("CombatPoll")
+        end
+    elseif lock_active and not cf.session_active then
+        append_log(
+            "COMBAT SESSION STALE LOCK" ..
+            " | Action=ForceLockOff"
+        )
+        pcall(function()
+            apply_lock_fov(component, false)
+        end)
+        CloUtil.restore_combat_offset_z("StaleLockOutsideSession")
+        CloUtil.stop_combat_fov_tween("StaleLockOutsideSession")
+        fov_applied = false
     end
 end
 
@@ -1195,29 +2427,6 @@ local function start_input_observer()
         )
         input_observer_poll()
     end)
-end
-
-local function camera_from_combat(combat)
-    if combat == nil then
-        return nil
-    end
-
-    local owner = nil
-    pcall(function()
-        owner = combat:GetOwner()
-    end)
-
-    if owner == nil then
-        return nil
-    end
-
-    local camera = get_field(owner, "FollowCamera")
-
-    if valid_object(camera) then
-        return camera
-    end
-
-    return nil
 end
 
 -- Non-Lock-On camera transform test state.
@@ -2473,12 +3682,487 @@ local function write_active_targeting_offset_z(mode, offset, target_z)
     return nested_write_ok, struct_write_ok, fresh_z
 end
 
+local function write_active_targeting_offset_y(mode, offset, target_y)
+    if not valid_object(mode) or offset == nil or target_y == nil then
+        return false, false, nil
+    end
+
+    local nested_write_ok = pcall(function()
+        offset.Y = target_y
+    end)
+    local struct_write_ok = pcall(function()
+        mode.CameraLocationOffsetDuringTargeting = offset
+    end)
+    local fresh_y = tonumber(get_unwrapped_field(
+        get_field(mode, "CameraLocationOffsetDuringTargeting"),
+        "Y"
+    ))
+    return nested_write_ok, struct_write_ok, fresh_y
+end
+
 function CloUtil.combat_offset_z_wanted()
-    return mod_enabled and (tonumber(config.LockOnOffsetZ) or 0) > 0.001
+    return CloUtil.combat_mod_active() and lock_active and
+        (tonumber(config.LockOnOffsetZ) or 0) > 0.001
 end
 
 function CloUtil.in_combat_context()
-    return combat_mode_last ~= nil and combat_mode_last ~= 0
+    return CloUtil.combat_fov.session_active
+end
+
+function CloUtil.combat_mod_active()
+    return mod_enabled and CloUtil.combat_fov.session_active
+end
+
+function CloUtil.is_defensive_combat_state()
+    return CloUtil.combat_fov.last_state == 6
+end
+
+function CloUtil.log_user_mark(source)
+    local combat = tracked_combat
+    if not valid_object(combat) then
+        combat = combat_component
+    end
+
+    local cf = CloUtil.combat_fov
+    local mode_text = nil
+    if valid_object(combat) then
+        mode_text = readable_runtime_value(
+            unwrap_value(get_field(combat, "CurrentCombatMode"))
+        )
+    end
+
+    local camera = tracked_camera
+    if not valid_object(camera) then
+        camera = camera_from_combat(combat)
+    end
+
+    local camera_type = "<unavailable>"
+    if valid_object(camera) then
+        pcall(function()
+            camera_type = tostring(camera:GetCameraType())
+        end)
+    end
+
+    local manager_fov = CloUtil.read_manager_fov()
+    local sheath_debounce = cf.exit_zero_since_ms ~= nil
+
+    append_log(
+        "USER MARK | Event=CombatOver" ..
+        " | Source=" .. tostring(source) ..
+        " | SessionActive=" .. tostring(cf.session_active) ..
+        " | LockActive=" .. tostring(lock_active) ..
+        " | FOVApplied=" .. tostring(fov_applied) ..
+        " | CombatMode=" .. tostring(mode_text) ..
+        " | GameHardLock=" .. tostring(game_hard_lock_active) ..
+        " | SheathDebounce=" .. tostring(sheath_debounce) ..
+        " | TypePulseDone=" .. tostring(cf.fov_type_pulse_done) ..
+        " | CameraType=" .. tostring(camera_type) ..
+        " | ManagerFOV=" .. tostring(manager_fov) ..
+        " | FovTweenDir=" .. tostring(cf.direction) ..
+        " | FovTweenActive=" .. tostring(cf.poll_active) ..
+        " | RestoreViewFOV=" .. tostring(cf.restore_view_fov)
+    )
+    return true
+end
+
+function CloUtil.pulse_unlocked_camera_type_for_fov(reason)
+    local cf = CloUtil.combat_fov
+    if cf.fov_type_pulse_done or lock_active or not cf.session_active then
+        cf.fov_type_pulse_pending = false
+        return false
+    end
+    if not fov_applied then
+        cf.fov_type_pulse_pending = true
+        return false
+    end
+
+    local combat = tracked_combat
+    if not valid_object(combat) then
+        combat = find_combat_component()
+        tracked_combat = combat
+    end
+    if valid_object(combat) then
+        local state_text = readable_runtime_value(get_field(combat, "CurrentState"))
+        local state = tonumber(state_text)
+        if state ~= nil then
+            cf.last_state = state
+        end
+    end
+    if CloUtil.is_defensive_combat_state() then
+        cf.fov_type_pulse_pending = true
+        if config.EnableLog then
+            append_log(
+                "COMBAT FOV TYPE HOLD DEFERRED" ..
+                " | Reason=" .. tostring(reason) ..
+                " | CurrentState=" .. tostring(cf.last_state)
+            )
+        end
+        return false
+    end
+
+    local camera = tracked_camera
+    if not valid_object(camera) then
+        camera = camera_from_combat(combat)
+        tracked_camera = camera
+    end
+    if not valid_object(camera) then
+        cf.fov_type_pulse_pending = true
+        return false
+    end
+
+    local before = CAMERA_TYPE_DEFAULT
+    pcall(function()
+        before = camera:GetCameraType()
+    end)
+    if tonumber(before) == CAMERA_TYPE_NONE then
+        cf.fov_type_pulse_done = true
+        cf.fov_type_pulse_pending = false
+        return true
+    end
+
+    local to_none = pcall(function()
+        camera:SetCameraType(CAMERA_TYPE_NONE)
+    end)
+
+    local after = "<unavailable>"
+    pcall(function()
+        after = tostring(camera:GetCameraType())
+    end)
+
+    cf.fov_type_pulse_done = to_none
+    cf.fov_type_pulse_pending = not to_none
+
+    if config.EnableLog then
+        append_log(
+            "COMBAT FOV TYPE HOLD" ..
+            " | Reason=" .. tostring(reason) ..
+            " | Before=" .. tostring(before) ..
+            " | Set0=" .. tostring(to_none) ..
+            " | After=" .. tostring(after)
+        )
+    end
+
+    return to_none
+end
+
+function CloUtil.release_combat_fov_camera_type(reason)
+    if lock_active or not CloUtil.combat_fov.session_active then
+        return false
+    end
+
+    local cf = CloUtil.combat_fov
+    if not cf.fov_type_pulse_done then
+        return false
+    end
+
+    local combat = tracked_combat
+    if not valid_object(combat) then
+        combat = find_combat_component()
+        tracked_combat = combat
+    end
+
+    local camera = tracked_camera
+    if not valid_object(camera) then
+        camera = camera_from_combat(combat)
+        tracked_camera = camera
+    end
+    if not valid_object(camera) then
+        return false
+    end
+
+    local before = CAMERA_TYPE_DEFAULT
+    pcall(function()
+        before = camera:GetCameraType()
+    end)
+
+    local released = true
+    if tonumber(before) ~= CAMERA_TYPE_DEFAULT then
+        released = pcall(function()
+            camera:SetCameraType(CAMERA_TYPE_DEFAULT)
+        end)
+    end
+
+    local after = "<unavailable>"
+    pcall(function()
+        after = tostring(camera:GetCameraType())
+    end)
+
+    cf.fov_type_pulse_done = false
+    cf.fov_type_pulse_pending = false
+
+    if config.EnableLog then
+        append_log(
+            "COMBAT SHEATH TYPE RELEASE" ..
+            " | Reason=" .. tostring(reason) ..
+            " | Before=" .. tostring(before) ..
+            " | Set1=" .. tostring(released) ..
+            " | After=" .. tostring(after)
+        )
+    end
+
+    return released
+end
+
+function CloUtil.repulse_combat_fov_camera_type(reason)
+    if lock_active or not CloUtil.combat_fov.session_active then
+        return false
+    end
+
+    local cf = CloUtil.combat_fov
+    cf.fov_type_pulse_done = false
+    cf.fov_type_pulse_pending = false
+    tracked_camera = nil
+
+    local combat = tracked_combat
+    if not valid_object(combat) then
+        combat = find_combat_component()
+        tracked_combat = combat
+    end
+    if valid_object(combat) then
+        local camera = camera_from_combat(combat)
+        if valid_object(camera) then
+            tracked_camera = camera
+        end
+    end
+
+    return CloUtil.pulse_unlocked_camera_type_for_fov(reason)
+end
+
+function CloUtil.handle_sheath_abort_redraw()
+    if lock_active or not CloUtil.combat_fov.session_active or
+        not mod_enabled or not config.FOVEnabled then
+        return false
+    end
+
+    local cf = CloUtil.combat_fov
+    local combat = tracked_combat
+    if not valid_object(combat) then
+        combat = find_combat_component()
+        tracked_combat = combat
+    end
+
+    cf.sheath_abort_rearm_pending = true
+
+    local restore_fov = CloUtil.get_restore_view_fov()
+    cf.fov_type_pulse_done = false
+    cf.fov_type_pulse_pending = false
+    CloUtil.stop_combat_fov_tween("SheathAbortReset")
+
+    tracked_camera = nil
+    local camera = camera_from_combat(combat)
+    if valid_object(camera) then
+        tracked_camera = camera
+        pcall(function()
+            camera:SetCameraType(CAMERA_TYPE_DEFAULT)
+        end)
+    end
+
+    if type(restore_fov) == "number" then
+        CloUtil.publish_combat_fov_to_view(restore_fov, "SheathAbortReset", true)
+        CloUtil.set_manager_fov(restore_fov, "SheathAbortReset", true)
+    end
+
+    if config.EnableLog then
+        append_log(
+            "COMBAT SHEATH ABORT RESET" ..
+            " | RestoreFOV=" .. tostring(restore_fov) ..
+            " | ManagerFOV=" .. tostring(CloUtil.read_manager_fov()) ..
+            " | CameraType=1"
+        )
+    end
+
+    if type(ExecuteWithDelay) ~= "function" or
+        type(ExecuteInGameThread) ~= "function" then
+        cf.sheath_abort_rearm_pending = false
+        CloUtil.arm_combat_fov("SheathAbortRedraw")
+        return true
+    end
+
+    local generation = runtime_generation
+    ExecuteWithDelay(500, function()
+        if generation ~= runtime_generation then
+            return
+        end
+        ExecuteInGameThread(function()
+            if generation ~= runtime_generation or
+                not cf.session_active or lock_active or
+                not mod_enabled or not config.FOVEnabled then
+                cf.sheath_abort_rearm_pending = false
+                return
+            end
+            cf.sheath_abort_rearm_pending = false
+            tracked_camera = nil
+            cf.fov_type_pulse_done = false
+            CloUtil.arm_combat_fov("SheathAbortRedraw")
+        end)
+    end)
+    return true
+end
+
+function CloUtil.bootstrap_combat_fov(reason)
+    if CloUtil.combat_fov.sheath_abort_rearm_pending then
+        return false
+    end
+    if not mod_enabled or not config.FOVEnabled or not CloUtil.in_combat_context() then
+        return false
+    end
+    if fov_applied then
+        return CloUtil.refresh_combat_fov_view(reason, false)
+    end
+
+    return CloUtil.arm_combat_fov(reason)
+end
+
+function CloUtil.begin_combat_session(combat, reason, arm_fov)
+    local cf = CloUtil.combat_fov
+    if not cf.session_active then
+        cf.session_active = true
+        cf.exit_pending = 0
+        cf.exit_zero_since_ms = nil
+        cf.last_catchup_ms = nil
+        cf.fov_type_pulse_done = false
+        cf.fov_type_pulse_pending = false
+    end
+
+    if arm_fov == true and mod_enabled and config.FOVEnabled then
+        CloUtil.bootstrap_combat_fov(reason)
+    elseif arm_fov == true and config.FOVEnabled then
+        cf.pending_enter = true
+    end
+
+    return true
+end
+
+function CloUtil.apply_deferred_lock_writes(reason)
+    local cf = CloUtil.combat_fov
+    if not cf.lock_writes_deferred or not lock_active or not game_hard_lock_active then
+        cf.lock_writes_deferred = false
+        return false
+    end
+    if CloUtil.is_defensive_combat_state() then
+        return false
+    end
+
+    local combat = tracked_combat
+    if not valid_object(combat) then
+        combat = find_combat_component()
+        tracked_combat = combat
+    end
+
+    local camera = tracked_camera
+    if not valid_object(camera) then
+        camera = camera_from_combat(combat)
+        tracked_camera = camera
+    end
+
+    if not valid_object(camera) or not valid_object(combat) then
+        return false
+    end
+
+    cf.lock_writes_deferred = false
+
+    if previous_camera_type == nil then
+        local camera_type = CAMERA_TYPE_DEFAULT
+        if not cf.fov_type_pulse_done then
+            pcall(function()
+                camera_type = camera:GetCameraType()
+            end)
+        end
+        previous_camera_type = camera_type
+    end
+
+    local camera_ok = pcall(function()
+        camera:SetCameraType(CAMERA_TYPE_NONE)
+    end)
+
+    set_camera_detached_state(combat, true)
+    CloUtil.apply_lock_offsets(reason)
+
+    if not stack_poll_active then
+        start_stack_poll()
+    end
+
+    if config.EnableLog then
+        append_log(
+            "LOCK DEFERRED WRITES APPLIED" ..
+            " | Reason=" .. tostring(reason) ..
+            " | SetCameraType0=" .. tostring(camera_ok)
+        )
+    end
+
+    return camera_ok
+end
+
+function CloUtil.end_combat_session(combat, reason)
+    local cf = CloUtil.combat_fov
+    if not cf.session_active then
+        return false
+    end
+
+    local combat_type_forced = cf.fov_type_pulse_done or fov_applied
+    cf.session_active = false
+    cf.exit_pending = 0
+    cf.exit_zero_since_ms = nil
+    cf.pending_enter = false
+    cf.lock_writes_deferred = false
+    cf.last_catchup_ms = nil
+    cf.sheath_abort_rearm_pending = false
+    if not valid_object(combat) then
+        combat = find_combat_component()
+    end
+
+    if lock_active then
+        local ok, err = pcall(function()
+            apply_lock_fov(combat, false)
+        end)
+        append_log(
+            "COMBAT EXIT CLEANUP | PCallOK=" .. tostring(ok) ..
+            " | Error=" .. tostring(err) ..
+            " | LockActiveAfter=" .. tostring(lock_active) ..
+            " | FOVAppliedAfter=" .. tostring(fov_applied)
+        )
+    else
+        append_log("COMBAT EXIT CLEANUP | No active Lock-On session")
+        if combat_type_forced then
+            local camera = tracked_camera
+            if not valid_object(camera) then
+                camera = camera_from_combat(combat)
+            end
+            local restored = pcall(function()
+                if valid_object(camera) then
+                    camera:SetCameraType(CAMERA_TYPE_DEFAULT)
+                end
+            end)
+            append_log(
+                "COMBAT TYPE HOLD RESTORE" ..
+                " | Target=1" ..
+                " | Success=" .. tostring(restored)
+            )
+        end
+    end
+
+    cf.fov_type_pulse_done = false
+    cf.fov_type_pulse_pending = false
+
+    CloUtil.restore_combat_offset_z("CombatExit")
+
+    if config.FOVEnabled and mod_enabled then
+        local ok, err = pcall(function()
+            CloUtil.start_combat_fov_tween("out", reason)
+        end)
+        if not ok and config.EnableLog then
+            append_log(
+                "COMBAT FOV TWEEN OUT ERROR" ..
+                " | Reason=" .. tostring(reason) ..
+                " | Error=" .. tostring(err)
+            )
+        end
+    else
+        CloUtil.stop_combat_fov_tween("CombatExit")
+        fov_applied = false
+    end
+
+    return true
 end
 
 local function get_player_camera_for_offset()
@@ -2920,44 +4604,10 @@ function CloUtil.log_tracked_vitality_if_due()
         return
     end
 
-    local owner = nil
-    pcall(function()
-        if tracked.GetOwner ~= nil then
-            owner = tracked:GetOwner()
-        end
-    end)
-
-    local parts = {
-        "LOCK VITALITY",
-        "Tracked=" .. readable_runtime_value(tracked),
-        "Owner=" .. (valid_object(owner) and readable_runtime_value(owner) or "<nil>"),
-    }
-
-    local function append_field(label, obj)
-        if not valid_object(obj) then
-            return
-        end
-        for _, field_name in ipairs(CloUtil.LOCK_TARGET_DEAD_BOOL_FIELDS) do
-            local value = unwrap_value(get_field(obj, field_name))
-            if value ~= nil then
-                parts[#parts + 1] = label .. "." .. field_name .. "=" .. tostring(value)
-            end
-        end
-        for _, field_name in ipairs(CloUtil.LOCK_TARGET_HEALTH_FIELDS) do
-            local value = tonumber(unwrap_value(get_field(obj, field_name)))
-            if value ~= nil then
-                parts[#parts + 1] = label .. "." .. field_name .. "=" .. tostring(value)
-            end
-        end
-        local alive = unwrap_value(get_field(obj, "bIsAlive"))
-        if alive ~= nil then
-            parts[#parts + 1] = label .. ".bIsAlive=" .. tostring(alive)
-        end
-    end
-
-    append_field("Tracked", tracked)
-    append_field("Owner", owner)
-    append_log(table.concat(parts, " | "))
+    append_log(
+        "LOCK VITALITY | Tracked=" .. tostring(CloUtil.lock_target.name) ..
+        " | Address=" .. tostring(CloUtil.lock_target.address)
+    )
 end
 
 function CloUtil.log_lock_target_changed(from_address, from_name, to_target, reason, target_field)
@@ -3141,9 +4791,6 @@ function CloUtil.is_lock_target_gone(target)
     end
 
     local subjects = CloUtil.resolve_lock_target_subjects(target)
-    if subjects.owner_missing == true then
-        return true, "OwnerInvalid"
-    end
 
     for index, subject in ipairs(subjects) do
         local gone, reason = CloUtil.check_subject_gone(subject)
@@ -3197,7 +4844,7 @@ function CloUtil.scan_hard_lock_fields(combat)
 end
 
 function CloUtil.should_restore_fov_session(combat)
-    if not lock_active and not fov_applied then
+    if not lock_active then
         return false, nil
     end
 
@@ -3220,6 +4867,9 @@ function CloUtil.should_restore_fov_session(combat)
 
     local lock_target, target_field = CloUtil.read_lock_target_actor(combat)
     if not valid_object(lock_target) then
+        if game_hard_lock_active and CloUtil.in_combat_context() then
+            return false, "EmptyTargetCombatSwap"
+        end
         return true, "EmptyTarget"
     end
 
@@ -3308,6 +4958,10 @@ end
 
 function CloUtil.restore_stuck_lock_fov(reason, full_scan)
     if not mod_enabled or not config.FOVEnabled then
+        return 0
+    end
+
+    if CloUtil.in_combat_context() or lock_active then
         return 0
     end
 
@@ -3419,7 +5073,7 @@ function CloUtil.finish_mod_unlock(combat, reason)
 end
 
 function CloUtil.sync_lock_with_game(reason)
-    if not mod_enabled or not config.FOVEnabled then
+    if not mod_enabled then
         return false
     end
 
@@ -3468,21 +5122,13 @@ function CloUtil.sync_lock_with_game(reason)
                 combat,
                 reason .. "+" .. tostring(unlock_detail)
             )
-        elseif lock_active or fov_applied then
+        elseif lock_active then
             ok, err = pcall(function()
                 apply_lock_fov(combat, false)
             end)
             if not ok then
                 append_log("FOV SYNC LOCK OFF ERROR | " .. tostring(err))
             end
-        end
-
-        if unlock_detail == "EmptyTarget" or
-            (type(unlock_detail) == "string" and (
-                unlock_detail:sub(1, 10) == "DeadTarget" or
-                unlock_detail:sub(1, 11) == "TrackedDead" or
-                unlock_detail:sub(1, 15) == "PlayerLockLost")) then
-            CloUtil.schedule_unlock_fov_fixup(reason .. "+" .. tostring(unlock_detail))
         end
 
         append_log(
@@ -3496,12 +5142,6 @@ function CloUtil.sync_lock_with_game(reason)
             " | GameHardLockAfter=" .. tostring(game_hard_lock_active)
         )
         return true
-    end
-
-    if not game_hard_lock_active then
-        if CloUtil.restore_stuck_lock_fov(reason) > 0 then
-            return true
-        end
     end
 
     return false
@@ -3773,18 +5413,6 @@ end
 -- PlayerCameraManager output in addition to the FollowCamera/CameraMode data.
 local camera_chain_probe_generation = 0
 
-local function get_player_camera_manager()
-    local controller = nil
-    local manager = nil
-    pcall(function()
-        controller = GetPlayerController()
-    end)
-    if valid_object(controller) then
-        manager = get_field(controller, "PlayerCameraManager")
-    end
-    return controller, manager
-end
-
 local function read_camera_pov(owner, cache_field)
     if not valid_object(owner) then
         return {
@@ -3907,7 +5535,15 @@ function CloUtil.schedule_unlock_fov_fixup(reason)
                         reason .. "+UnlockFix@" .. tostring(delay_ms),
                         false
                     )
-                    CloUtil.snap_manager_fov_to_default()
+                    if not CloUtil.in_combat_context() then
+                        CloUtil.snap_manager_fov_to_default()
+                    elseif config.FOVEnabled and
+                        CloUtil.in_combat_context() then
+                        CloUtil.refresh_combat_fov_view(
+                            reason .. "+UnlockFix@" .. tostring(delay_ms),
+                            false
+                        )
+                    end
                 end)
             end)
         end)
@@ -3915,40 +5551,7 @@ function CloUtil.schedule_unlock_fov_fixup(reason)
 end
 
 schedule_camera_chain_probe = function(reason)
-    if not config.EnableLog then
-        return
-    end
-
-    camera_chain_probe_generation = camera_chain_probe_generation + 1
-    local generation = camera_chain_probe_generation
-
-    local function safe_camera_chain_snapshot(delay_ms)
-        local ok, err = pcall(function()
-            camera_chain_snapshot(reason, delay_ms)
-        end)
-        if not ok then
-            append_log(
-                "CAMERA CHAIN SNAPSHOT ERROR" ..
-                " | Reason=" .. tostring(reason) ..
-                " | DelayMs=" .. tostring(delay_ms) ..
-                " | Error=" .. tostring(err)
-            )
-        end
-    end
-
-    if type(ExecuteWithDelay) ~= "function" then
-        safe_camera_chain_snapshot(0)
-        return
-    end
-
-    for _, delay_ms in ipairs({ 0, 10, 50, 100, 250, 500, 1000 }) do
-        ExecuteWithDelay(delay_ms, function()
-            if generation ~= camera_chain_probe_generation then
-                return
-            end
-            safe_camera_chain_snapshot(delay_ms)
-        end)
-    end
+    return
 end
 
 local function restore_camera_type(camera, restore_type)
@@ -4003,13 +5606,17 @@ function CloUtil.enforce_unlocked_camera(reason)
     end)
 
     if current_type == CAMERA_TYPE_NONE then
-        append_log(
-            "UNLOCK CAMERA ENFORCE" ..
-            " | Reason=" .. tostring(reason) ..
-            " | StuckCameraType=0 -> 1"
-        )
-        restore_camera_type(camera, CAMERA_TYPE_DEFAULT)
-        changed = true
+        local keep_combat_type = CloUtil.in_combat_context() and
+            CloUtil.combat_fov.fov_type_pulse_done
+        if not keep_combat_type then
+            append_log(
+                "UNLOCK CAMERA ENFORCE" ..
+                " | Reason=" .. tostring(reason) ..
+                " | StuckCameraType=0 -> 1"
+            )
+            restore_camera_type(camera, CAMERA_TYPE_DEFAULT)
+            changed = true
+        end
     end
 
     if valid_object(combat) then
@@ -4045,12 +5652,8 @@ end
 function CloUtil.force_unlock_cleanup(combat, reason)
     append_log("FORCE UNLOCK CLEANUP | Reason=" .. tostring(reason))
 
-    if lock_active or fov_applied then
+    if lock_active then
         CloUtil.end_fov_lock_session(reason)
-        return true
-    end
-
-    if CloUtil.restore_stuck_lock_fov(reason, false) > 0 then
         return true
     end
 
@@ -4085,32 +5688,66 @@ function CloUtil.schedule_post_unlock_camera_cleanup()
     end
 end
 
--- Apply the targeting offset to the CameraModes that are actually present in the
--- current CameraModeStack. Do not use the historical offset_modes cache here:
--- CameraMode instances can be replaced during combat while the stack remains active.
--- This path intentionally touches only CameraLocationOffsetDuringTargeting.Y and
--- does not modify any FOV or CameraType state.
+local function apply_enemy_offset_y_to_mode(mode, target_y, reason, index)
+    if not valid_object(mode) or target_y == nil then
+        return false
+    end
+    if is_ability_mode(mode) or CloUtil.is_transient_overlay_mode(mode) then
+        return false
+    end
+
+    local offset = get_field(mode, "CameraLocationOffsetDuringTargeting")
+    if offset == nil then
+        return false
+    end
+
+    local before_y = readable_probe_number(get_field(offset, "Y"))
+    if before_y ~= nil and math.abs(before_y - target_y) < 0.001 then
+        return true
+    end
+
+    local nested_ok, struct_ok, fresh_y = write_active_targeting_offset_y(mode, offset, target_y)
+    local readback_ok = fresh_y ~= nil and math.abs(fresh_y - target_y) < 0.001
+
+    append_log(
+        ((nested_ok and struct_ok and readback_ok) and "ENEMY OFFSET WRITE" or "ENEMY OFFSET WRITE FAILED") ..
+        " | Reason=" .. tostring(reason) ..
+        " | Index=" .. tostring(index) ..
+        " | Mode=" .. safe_full_name(mode) ..
+        " | BeforeY=" .. tostring(before_y) ..
+        " | TargetY=" .. tostring(target_y) ..
+        " | FreshAfterY=" .. tostring(fresh_y) ..
+        " | Readback=" .. tostring(readback_ok)
+    )
+
+    return nested_ok and struct_ok and readback_ok
+end
+
+-- Apply EnemyOffset Y to CameraModes on the live CameraModeStack.
 apply_combat_offset_fix = function(target_y_override, reason)
     local target_y = target_y_override
     if target_y == nil then
-        target_y = config.CameraOffsetFix and COMBAT_OFFSET_FIX_Y or COMBAT_OFFSET_DEFAULT_Y
+        target_y = CloUtil.enemy_offset_target_y()
     end
 
-    local camera = tracked_camera
+    tracked_camera = nil
+    local camera = camera_from_combat(tracked_combat)
     if not valid_object(camera) then
-        camera = camera_from_combat(tracked_combat)
-        tracked_camera = camera
+        local combat = find_combat_component()
+        tracked_combat = combat
+        camera = camera_from_combat(combat)
     end
+    tracked_camera = camera
 
     if not valid_object(camera) then
-        append_log("OFFSET APPLY FAILED | Reason=" .. tostring(reason) ..
+        append_log("ENEMY OFFSET APPLY FAILED | Reason=" .. tostring(reason) ..
             " | TargetY=" .. tostring(target_y) .. " | CameraUnavailable=true")
         return 0
     end
 
     local stack = get_field(camera, "CameraModeStack")
     if stack == nil then
-        append_log("OFFSET APPLY FAILED | Reason=" .. tostring(reason) ..
+        append_log("ENEMY OFFSET APPLY FAILED | Reason=" .. tostring(reason) ..
             " | TargetY=" .. tostring(target_y) .. " | CameraModeStackUnavailable=true")
         return 0
     end
@@ -4120,7 +5757,7 @@ apply_combat_offset_fix = function(target_y_override, reason)
         depth = stack:GetArrayNum()
     end)
     if not depth_ok or type(depth) ~= "number" or depth <= 0 then
-        append_log("OFFSET APPLY FAILED | Reason=" .. tostring(reason) ..
+        append_log("ENEMY OFFSET APPLY FAILED | Reason=" .. tostring(reason) ..
             " | TargetY=" .. tostring(target_y) ..
             " | StackDepth=" .. tostring(depth) .. " | StackUnavailable=true")
         return 0
@@ -4129,54 +5766,54 @@ apply_combat_offset_fix = function(target_y_override, reason)
     local changed = 0
     for index = 1, depth do
         local entry = nil
-        local entry_ok = pcall(function()
+        pcall(function()
             entry = stack[index]
         end)
-
-        if entry_ok and entry ~= nil then
+        if entry ~= nil then
             local mode = nil
             pcall(function()
                 mode = entry.CameraMode
             end)
-
-            if valid_object(mode) and
-                not is_ability_mode(mode) and
-                not CloUtil.is_transient_overlay_mode(mode) then
-                local offset = get_field(mode, "CameraLocationOffsetDuringTargeting")
-                if offset ~= nil then
-                    local before_y = readable_probe_number(get_field(offset, "Y"))
-                    -- Skip modes whose Y cannot be read as a number (e.g. Base
-                    -- returning TrivialObject). Writing those was crash-prone.
-                    if before_y == nil then
-                        -- Silent skip: Base_LongRange Y is routinely unreadable.
-                    elseif math.abs(before_y - target_y) < 0.001 then
-                        -- Already at target; avoid redundant writes on Lock refresh.
-                    else
-                        local write_ok = pcall(function()
-                            offset.Y = target_y
-                        end)
-                        local after_y = readable_probe_number(get_field(offset, "Y"))
-
-                        append_log(
-                            (write_ok and "OFFSET WRITE" or "OFFSET WRITE FAILED") ..
-                            " | Reason=" .. tostring(reason) ..
-                            " | Index=" .. tostring(index) ..
-                            " | Mode=" .. safe_full_name(mode) ..
-                            " | BeforeY=" .. tostring(before_y) ..
-                            " | TargetY=" .. tostring(target_y) ..
-                            " | AfterY=" .. tostring(after_y)
-                        )
-
-                        if write_ok then
-                            changed = changed + 1
-                        end
-                    end
-                end
+            if apply_enemy_offset_y_to_mode(mode, target_y, reason, index) then
+                changed = changed + 1
             end
         end
     end
 
+    append_log(
+        "ENEMY OFFSET APPLY | Reason=" .. tostring(reason) ..
+        " | TargetY=" .. tostring(target_y) ..
+        " | Changed=" .. tostring(changed) ..
+        " | LockActive=" .. tostring(lock_active)
+    )
+
     return changed
+end
+
+function CloUtil.apply_enemy_offset(reason)
+    if not mod_enabled then
+        return 0
+    end
+    return apply_combat_offset_fix(CloUtil.enemy_offset_target_y(), reason)
+end
+
+function CloUtil.apply_lock_offsets(reason)
+    if CloUtil.is_defensive_combat_state() then
+        return
+    end
+    if CloUtil.combat_offset_z_wanted() then
+        CloUtil.apply_combat_offset_z(reason)
+    end
+    if lock_active then
+        apply_combat_offset_fix(CloUtil.enemy_offset_target_y(), reason)
+    end
+end
+
+function CloUtil.restore_lock_offsets(reason)
+    CloUtil.restore_combat_offset_z(reason)
+    if mod_enabled then
+        apply_combat_offset_fix(COMBAT_OFFSET_DEFAULT_Y, reason)
+    end
 end
 
 local function restore_fov_defaults()
@@ -4211,6 +5848,10 @@ local function restore_fov_defaults()
 end
 
 function CloUtil.end_fov_lock_session(reason)
+    if not lock_active then
+        return
+    end
+
     stop_stack_poll()
 
     local combat = tracked_combat
@@ -4228,13 +5869,23 @@ function CloUtil.end_fov_lock_session(reason)
         restore_type = CAMERA_TYPE_DEFAULT
     end
 
-    local camera_ok, camera_err = pcall(function()
-        if valid_object(camera) then
-            restore_camera_type(camera, restore_type)
+    local keep_combat_type = CloUtil.in_combat_context() and
+        CloUtil.combat_fov.fov_type_pulse_done
+    if keep_combat_type then
+        append_log(
+            "LOCK OFF CAMERA TYPE HOLD" ..
+            " | CurrentType=0" ..
+            " | SessionActive=true"
+        )
+    else
+        local camera_ok, camera_err = pcall(function()
+            if valid_object(camera) then
+                restore_camera_type(camera, restore_type)
+            end
+        end)
+        if not camera_ok then
+            append_log("FOV SESSION END CAMERA ERROR | " .. tostring(camera_err))
         end
-    end)
-    if not camera_ok then
-        append_log("FOV SESSION END CAMERA ERROR | " .. tostring(camera_err))
     end
 
     local detach_ok, detach_err = pcall(function()
@@ -4246,30 +5897,20 @@ function CloUtil.end_fov_lock_session(reason)
         append_log("FOV SESSION END DETACH ERROR | " .. tostring(detach_err))
     end
 
-    local fov_ok, fov_err = pcall(function()
-        restore_fov_defaults()
-    end)
-    if not fov_ok then
-        append_log("FOV SESSION END RESTORE ERROR | " .. tostring(fov_err))
-    end
-
     pcall(function()
-        CloUtil.restore_stuck_lock_fov(reason, false)
+        CloUtil.restore_lock_offsets(reason)
     end)
 
     stop_pitch_monitor("LockOff")
-    saved_modes = {}
     saved_camera_detached = {}
     previous_camera_type = nil
     tracked_combat = nil
     tracked_camera = nil
     CloUtil.set_active_lock_target(nil)
-    fov_applied = false
     lock_active = false
 
     append_log("FOV SESSION END | Reason=" .. tostring(reason))
 
-    CloUtil.schedule_unlock_fov_fixup(reason)
     CloUtil.schedule_post_unlock_camera_cleanup()
     if type(schedule_camera_chain_probe) == "function" then
         schedule_camera_chain_probe("LockOff+" .. tostring(reason))
@@ -4326,6 +5967,22 @@ local function refresh_lock_target_swap(combat)
 
     local tracked_gone, tracked_reason = CloUtil.is_tracked_lock_target_gone()
     if tracked_gone then
+        if game_hard_lock_active and CloUtil.in_combat_context() then
+            append_log(
+                "LOCK TARGET SWAP PENDING" ..
+                " | Reason=TrackedTargetDead" ..
+                " | Detail=" .. tostring(tracked_reason) ..
+                " | OldTarget=" .. tostring(CloUtil.lock_target.name) ..
+                " | NextTarget=" .. tostring(new_name)
+            )
+            CloUtil.set_active_lock_target(nil)
+            CloUtil.schedule_lock_state_probe_after_swap(
+                combat,
+                "TargetSwapAfterDeath"
+            )
+            return
+        end
+
         append_log(
             "LOCK TARGET SWAP -> LOCK OFF" ..
             " | Reason=TrackedTargetDead" ..
@@ -4356,20 +6013,14 @@ local function refresh_lock_target_swap(combat)
         tracked_camera = camera
     end
 
-    local fov_refreshed = false
-    if mod_enabled and config.FOVEnabled then
-        fov_refreshed = write_locked_fov()
-        if not fov_refreshed then
-            fov_refreshed = recover_fov_cache_and_write()
-        end
-        fov_applied = fov_refreshed
+    if lock_active then
+        CloUtil.apply_lock_offsets("TargetSwap")
     end
 
     append_log(
         "LOCK TARGET SWAP" ..
         " | Address=" .. tostring(new_address) ..
-        " | Name=" .. tostring(new_name) ..
-        " | FOVRefresh=" .. tostring(fov_refreshed)
+        " | Name=" .. tostring(new_name)
     )
 
     CloUtil.schedule_lock_state_probe_after_swap(combat, "TargetSwap")
@@ -4377,6 +6028,10 @@ end
 
 local function refresh_active_lock()
     if not lock_active then
+        return
+    end
+
+    if CloUtil.is_defensive_combat_state() then
         return
     end
 
@@ -4409,15 +6064,7 @@ local function refresh_active_lock()
             start_stack_poll()
         end
 
-        if mod_enabled and config.FOVEnabled then
-            local refreshed = write_locked_fov()
-            if not refreshed then
-                refreshed = recover_fov_cache_and_write()
-            end
-            fov_applied = refreshed
-        else
-            fov_applied = false
-        end
+        CloUtil.apply_lock_offsets("LockRefresh")
 
         local lock_target = CloUtil.read_lock_target_actor(combat)
         CloUtil.set_active_lock_target(lock_target)
@@ -4427,47 +6074,62 @@ end
 
 apply_lock_fov = function(combat, locked)
     if locked then
+        if not mod_enabled then
+            if config.EnableLog then
+                append_log("LOCK ON SKIPPED | Reason=ModDisabled")
+            end
+            return false
+        end
+
         if test_camera_enabled then
             set_test_camera_enabled(false)
         end
 
         local camera = camera_from_combat(combat)
         if camera == nil then
-            append_log("FOV LOCK ON ERROR | CameraUnavailable=true")
+            append_log("LOCK ON ERROR | CameraUnavailable=true")
             return false
         end
 
         tracked_combat = combat
         tracked_camera = camera
 
+        lock_active = true
+
+        local camera_ok = true
+        local detached_ok = false
+
+        if CloUtil.is_defensive_combat_state() then
+            CloUtil.combat_fov.lock_writes_deferred = true
+            start_stack_poll()
+            if config.EnableLog then
+                append_log(
+                    "LOCK ON DEFERRED WRITES | Reason=DefensiveState" ..
+                    " | CurrentState=" .. tostring(CloUtil.combat_fov.last_state)
+                )
+            end
+            return true
+        end
+
         if previous_camera_type == nil then
             local camera_type = CAMERA_TYPE_DEFAULT
-            pcall(function()
-                camera_type = camera:GetCameraType()
-            end)
+            if not CloUtil.combat_fov.fov_type_pulse_done then
+                pcall(function()
+                    camera_type = camera:GetCameraType()
+                end)
+            end
             previous_camera_type = camera_type
         end
 
-        local fov_ok = true
-        if mod_enabled and config.FOVEnabled then
-            fov_ok = write_locked_fov()
-            if not fov_ok then
-                fov_ok = recover_fov_cache_and_write()
-            end
-        end
-
-        local camera_ok = pcall(function()
+        camera_ok = pcall(function()
             camera:SetCameraType(CAMERA_TYPE_NONE)
         end)
 
-        local detached_ok = set_camera_detached_state(combat, true)
+        detached_ok = set_camera_detached_state(combat, true)
 
-        lock_active = true
-        fov_applied = mod_enabled and config.FOVEnabled and fov_ok
+        CloUtil.combat_fov.lock_writes_deferred = false
+        CloUtil.apply_lock_offsets("LockOn")
         start_stack_poll()
-
-        local lock_target, target_field = CloUtil.read_lock_target_actor(combat)
-        CloUtil.set_active_lock_target(lock_target)
 
         append_log(
             "FOV LOCK ON" ..
@@ -4476,16 +6138,15 @@ apply_lock_fov = function(combat, locked)
             " | PreviousCameraType=" .. tostring(previous_camera_type) ..
             " | SetCameraType0=" .. tostring(camera_ok) ..
             " | DetachedFromTarget=false=" .. tostring(detached_ok) ..
-            " | FOVApplied=" .. tostring(fov_applied) ..
-            " | Target=" .. tostring(CloUtil.lock_target.name) ..
-            " | TargetAddress=" .. tostring(CloUtil.lock_target.address) ..
-            " | TargetField=" .. tostring(target_field)
+            " | FOVApplied=" .. tostring(fov_applied)
         )
 
-        return fov_ok and camera_ok
+        return camera_ok
     end
 
-    CloUtil.end_fov_lock_session("LockOff")
+    if lock_active then
+        CloUtil.end_fov_lock_session("LockOff")
+    end
     return true
 end
 
@@ -4568,6 +6229,41 @@ local function get_camera_stack_mode(camera, index)
     return mode
 end
 
+function CloUtil.apply_fov_to_active_stack_top(target_fov, reason)
+    if type(target_fov) ~= "number" then
+        return false
+    end
+
+    local camera = get_player_camera_for_offset()
+    if not valid_object(camera) then
+        return false
+    end
+
+    local depth_ok, depth = get_camera_stack_depth(camera)
+    if not depth_ok or type(depth) ~= "number" or depth <= 0 then
+        return false
+    end
+
+    local mode = get_camera_stack_mode(camera, depth)
+    if not valid_object(mode) or CloUtil.is_transient_overlay_mode(mode) then
+        return false
+    end
+
+    cache_mode(mode)
+    local wrote = set_field(mode, "DefaultFieldOfView", target_fov)
+    if wrote and config.EnableLog and reason ~= nil then
+        append_log(
+            "COMBAT STACK TOP FOV" ..
+            " | Reason=" .. tostring(reason) ..
+            " | Depth=" .. tostring(depth) ..
+            " | Target=" .. tostring(target_fov) ..
+            " | Mode=" .. safe_full_name(mode)
+        )
+    end
+
+    return wrote == true
+end
+
 local function is_transient_overlay_stack_top(camera, depth)
     if type(depth) ~= "number" or depth <= 0 then
         return false
@@ -4628,14 +6324,16 @@ set_stack_camera_type = function(desired_type, depth)
         after = tostring(camera:GetCameraType())
     end)
 
-    append_log(
-        "CameraType " .. tostring(before) ..
-        " -> " .. tostring(desired_type) ..
-        " | success=" .. tostring(ok) ..
-        " | readback=" .. tostring(after) ..
-        " | BaseStackDepth=" .. tostring(baseline_stack_depth) ..
-        " | StackDepth=" .. tostring(depth)
-    )
+    if config.EnableLog then
+        append_log(
+            "CameraType " .. tostring(before) ..
+            " -> " .. tostring(desired_type) ..
+            " | success=" .. tostring(ok) ..
+            " | readback=" .. tostring(after) ..
+            " | BaseStackDepth=" .. tostring(baseline_stack_depth) ..
+            " | StackDepth=" .. tostring(depth)
+        )
+    end
 
     return ok
 end
@@ -4690,6 +6388,10 @@ function CloUtil.schedule_overlay_stack_recovery(stack_generation)
                 return
             end
 
+            if CloUtil.is_defensive_combat_state() then
+                return
+            end
+
             local depth_ok, depth = get_camera_stack_depth(camera)
             if not depth_ok or baseline_stack_depth == nil then
                 return
@@ -4725,16 +6427,7 @@ function CloUtil.schedule_overlay_stack_recovery(stack_generation)
                 set_stack_camera_type(CAMERA_TYPE_NONE, depth)
             end)
 
-            if mod_enabled and config.FOVEnabled then
-                pcall(function()
-                    if not write_locked_fov() then
-                        recover_fov_cache_and_write()
-                    end
-                end)
-            end
-
             overlay.recovery_pending = false
-            CloUtil.mark_overlay_recovery_quiet()
 
             if config.EnableLog then
                 append_log(
@@ -4742,6 +6435,10 @@ function CloUtil.schedule_overlay_stack_recovery(stack_generation)
                     " | Depth=" .. tostring(depth) ..
                     " | BaseStackDepth=" .. tostring(baseline_stack_depth)
                 )
+            end
+
+            if mod_enabled and config.FOVEnabled and CloUtil.in_combat_context() then
+                CloUtil.refresh_combat_fov_view("OverlayRecovery", false)
             end
         end)
     end)
@@ -4778,14 +6475,15 @@ local function stack_poll()
             local stack_changed = last_stack_depth == nil or depth ~= last_stack_depth
 
             if stack_changed then
-                append_log(
-                    "CameraModeStack depth changed" ..
-                    " | BaseStackDepth=" .. tostring(baseline_stack_depth) ..
-                    " | PreviousDepth=" .. tostring(last_stack_depth) ..
-                    " | CurrentDepth=" .. tostring(depth)
-                )
+                local previous_depth = last_stack_depth
                 last_stack_depth = depth
                 if config.EnableLog then
+                    append_log(
+                        "CameraModeStack depth changed" ..
+                        " | BaseStackDepth=" .. tostring(baseline_stack_depth) ..
+                        " | PreviousDepth=" .. tostring(previous_depth) ..
+                        " | CurrentDepth=" .. tostring(depth)
+                    )
                     log_camera_mode_stack_probe(camera, depth)
                 end
             end
@@ -4801,68 +6499,43 @@ local function stack_poll()
             end
 
             CloUtil.stack_overlay.active = overlay_active
+            CloUtil.combat_fov.paused = overlay_active
 
-            if baseline_stack_depth ~= nil then
-                if depth > baseline_stack_depth then
-                    -- Release lock camera type while overlay modes sit above baseline.
-                    CloUtil.stack_overlay.recovery_pending = false
-                    set_stack_camera_type(CAMERA_TYPE_DEFAULT, depth)
-                elseif depth == baseline_stack_depth and not overlay_top then
-                    if CloUtil.stack_overlay.recovery_pending then
-                        -- Deferred handler will restore lock camera type.
-                    elseif was_overlay and stack_changed then
-                        CloUtil.stack_overlay.recovery_pending = true
-                        CloUtil.schedule_overlay_stack_recovery(generation)
-                        if config.EnableLog then
-                            append_log(
-                                "STACK OVERLAY RECOVERY SCHEDULED" ..
-                                " | DelayMs=" .. tostring(CloUtil.stack_overlay.recovery_ms) ..
-                                " | Depth=" .. tostring(depth)
-                            )
+            if not CloUtil.is_defensive_combat_state() then
+                if CloUtil.combat_fov.lock_writes_deferred then
+                    CloUtil.apply_deferred_lock_writes("StackPoll")
+                end
+
+                if baseline_stack_depth ~= nil then
+                    if depth > baseline_stack_depth then
+                        -- Release lock camera type while overlay modes sit above baseline.
+                        CloUtil.stack_overlay.recovery_pending = false
+                        set_stack_camera_type(CAMERA_TYPE_DEFAULT, depth)
+                    elseif depth == baseline_stack_depth and not overlay_top then
+                        if CloUtil.stack_overlay.recovery_pending then
+                            -- Deferred handler will restore lock camera type.
+                        elseif was_overlay and stack_changed then
+                            CloUtil.stack_overlay.recovery_pending = true
+                            CloUtil.schedule_overlay_stack_recovery(generation)
+                            if config.EnableLog then
+                                append_log(
+                                    "STACK OVERLAY RECOVERY SCHEDULED" ..
+                                    " | DelayMs=" .. tostring(CloUtil.stack_overlay.recovery_ms) ..
+                                    " | Depth=" .. tostring(depth)
+                                )
+                            end
+                        elseif stack_changed then
+                            set_stack_camera_type(CAMERA_TYPE_NONE, depth)
                         end
-                    elseif stack_changed then
-                        set_stack_camera_type(CAMERA_TYPE_NONE, depth)
+                    elseif stack_changed and depth < baseline_stack_depth then
+                        append_log(
+                            "CameraModeStack below baseline | no recovery" ..
+                            " | BaseStackDepth=" .. tostring(baseline_stack_depth) ..
+                            " | CurrentDepth=" .. tostring(depth)
+                        )
                     end
-                elseif stack_changed and depth < baseline_stack_depth then
-                    append_log(
-                        "CameraModeStack below baseline | no recovery" ..
-                        " | BaseStackDepth=" .. tostring(baseline_stack_depth) ..
-                        " | CurrentDepth=" .. tostring(depth)
-                    )
                 end
-            end
 
-            if stack_changed and mod_enabled and config.FOVEnabled then
-                if overlay_active then
-                    if config.EnableLog then
-                        append_log(
-                            "STACK POLL SKIP FOV" ..
-                            " | Depth=" .. tostring(depth) ..
-                            " | Top=" .. describe_camera_mode(get_camera_stack_mode(camera, depth))
-                        )
-                    end
-                elseif was_overlay then
-                    if config.EnableLog then
-                        append_log(
-                            "STACK POLL DEFER FOV" ..
-                            " | Depth=" .. tostring(depth) ..
-                            " | DelayMs=" .. tostring(CloUtil.stack_overlay.recovery_ms)
-                        )
-                    end
-                elseif CloUtil.is_hot_fov_write_quiet() then
-                    if config.EnableLog then
-                        append_log(
-                            "STACK POLL SKIP FOV QUIET" ..
-                            " | Depth=" .. tostring(depth) ..
-                            " | RecoveryPending=" ..
-                            tostring(CloUtil.stack_overlay.recovery_pending) ..
-                            " | OverlayActive=" ..
-                            tostring(CloUtil.stack_overlay.active)
-                        )
-                    end
-                elseif not write_locked_fov() then
-                    recover_fov_cache_and_write()
-                end
             end
 
         end
@@ -4934,20 +6607,50 @@ local function handle_new_camera_mode(mode, source)
 
     cache_mode(mode)
 
-    if lock_active and mod_enabled and config.FOVEnabled then
-        local ok = set_field(mode, "DefaultFieldOfView", config.LockOnFOV)
-        if ok then
-            fov_applied = true
+    local bound = CloUtil.combat_from_outer_object(mode)
+    if valid_object(bound) then
+        set_combat_component(bound, "CameraMode")
+        local bound_mode = tonumber(
+            unwrap_value(get_field(bound, "CurrentCombatMode"))
+        )
+        if bound_mode ~= nil and bound_mode ~= 0 then
+            if not CloUtil.combat_fov.session_active then
+                append_log(
+                    "COMBAT ENTER DETECTED | PreviousCombatMode=" ..
+                    tostring(combat_mode_last) ..
+                    " | CurrentCombatMode=" .. tostring(bound_mode) ..
+                    " | LockActive=" .. tostring(lock_active)
+                )
+                CloUtil.begin_combat_session(bound, "CombatEnter", true)
+            elseif not fov_applied and
+                not CloUtil.combat_fov.sheath_abort_rearm_pending then
+                CloUtil.bootstrap_combat_fov("CombatEnterCatchup")
+            end
         end
     end
 
-    if CloUtil.in_combat_context() and mod_enabled then
-        if combat_offset_z.active and CloUtil.combat_offset_z_wanted() then
+    if CloUtil.combat_mod_active() and config.FOVEnabled and
+        not CloUtil.combat_fov.sheath_abort_rearm_pending and
+        not CloUtil.is_transient_overlay_mode(mode) then
+        if fov_applied then
+            CloUtil.refresh_combat_fov_view("NewCameraMode", false)
+            if CloUtil.combat_fov.exit_zero_since_ms == nil then
+                CloUtil.repulse_combat_fov_camera_type("NewCameraMode")
+            end
+        else
+            local target = tonumber(config.LockOnFOV) or 110.0
+            cache_mode(mode)
+            set_field(mode, "DefaultFieldOfView", target)
+            CloUtil.publish_combat_fov_to_view(target, "NewCameraMode", false)
+        end
+    end
+
+    if lock_active and CloUtil.combat_mod_active() and
+        not CloUtil.is_defensive_combat_state() then
+        if CloUtil.combat_offset_z_wanted() then
             CloUtil.apply_combat_offset_z_to_mode(mode, "NewCameraMode", nil)
         end
-        if config.CameraOffsetFix then
-            apply_combat_offset_fix(COMBAT_OFFSET_FIX_Y, "NewCameraMode")
-        end
+        apply_combat_offset_fix(CloUtil.enemy_offset_target_y(), "NewCameraMode")
     end
 
     append_log(
@@ -5047,61 +6750,6 @@ else
     )
 end
 
-local SET_LOCK_TARGET_FUNCTION = "/Script/DogwoodCombat.PlayerCombatComponent:SetLockTarget"
-
-pcall(function()
-    RegisterHook(
-        SET_LOCK_TARGET_FUNCTION,
-        function() end,
-        function()
-            local refresh_generation = runtime_generation
-
-            ExecuteWithDelay(100, function()
-                if refresh_generation ~= runtime_generation then
-                    return
-                end
-
-                ExecuteInGameThread(function()
-                    if refresh_generation ~= runtime_generation then
-                        return
-                    end
-
-                    local combat = tracked_combat
-                    if not valid_object(combat) then
-                        combat = find_combat_component()
-                    end
-
-                    local lock_target, target_field = nil, nil
-                    if valid_object(combat) then
-                        lock_target, target_field = CloUtil.read_lock_target_actor(combat)
-                    end
-
-                    if lock_active then
-                        if CloUtil.log_lock_target_changed(
-                            CloUtil.lock_target.address,
-                            CloUtil.lock_target.name,
-                            lock_target,
-                            "SetLockTarget",
-                            target_field
-                        ) then
-                            CloUtil.schedule_lock_state_probe_after_swap(
-                                combat,
-                                "SetLockTarget"
-                            )
-                        end
-                    end
-
-                    CloUtil.sync_lock_with_game("SetLockTarget")
-
-                    if lock_active then
-                        refresh_active_lock()
-                    end
-                end)
-            end)
-        end
-    )
-end)
-
 -- Map/load transition safety.
 -- Do not attempt to restore state on the old world here: its UObject references
 -- may already be in teardown. Invalidate all delayed work and runtime object caches
@@ -5127,6 +6775,12 @@ local function invalidate_world_runtime(reason)
     saved_camera_detached = {}
     previous_camera_type = nil
     fov_applied = false
+    CloUtil.combat_fov.session_active = false
+    CloUtil.combat_fov.exit_pending = 0
+    CloUtil.combat_fov.lock_writes_deferred = false
+    CloUtil.combat_fov.last_state = nil
+    CloUtil.combat_fov.restore_view_fov = nil
+    CloUtil.combat_fov.sheath_abort_rearm_pending = false
     lock_active = false
     game_hard_lock_active = false
     CloUtil.set_active_lock_target(nil)
@@ -5288,33 +6942,11 @@ RegisterHook(
         -- In particular, a duplicate ON must never overwrite the original
         -- CameraType captured at the first ON.
         if locked and state_before then
-            local dup_target = CloUtil.read_lock_target_actor(combat)
-            local dup_target_valid = valid_object(dup_target)
-            local dup_address = dup_target_valid and object_address(dup_target) or nil
-            local swap_needed = dup_address ~= nil and
-                dup_address ~= CloUtil.lock_target.address
-
-            local dup_name = dup_target_valid and readable_runtime_value(dup_target) or nil
-
             append_log(
                 "HARDLOCK DUPLICATE EVENT | Event=ON" ..
                 " | LockActiveBefore=true" ..
-                " | TargetValid=" .. tostring(dup_target_valid) ..
-                " | Target=" .. tostring(dup_name) ..
-                " | TargetAddress=" .. tostring(dup_address) ..
-                " | ActiveTarget=" .. tostring(CloUtil.lock_target.name) ..
-                " | ActiveTargetAddress=" .. tostring(CloUtil.lock_target.address) ..
-                " | Action=" .. (swap_needed and "targetSwap" or
-                    (dup_target_valid and "ignored" or "sync"))
+                " | Action=ignored"
             )
-
-            if swap_needed then
-                pcall(function()
-                    refresh_lock_target_swap(combat)
-                end)
-            elseif not dup_target_valid then
-                CloUtil.sync_lock_with_game("HardLockDuplicateON")
-            end
 
             append_log(
                 "HARDLOCK HANDLER COMPLETE" ..
@@ -5324,10 +6956,6 @@ RegisterHook(
                 " | FOVApplied=" .. tostring(fov_applied)
             )
             return
-        end
-
-        if locked and (not state_before) then
-            CloUtil.restore_stuck_lock_fov("PreLockOnCleanup")
         end
 
         if (not locked) and (not state_before) then
@@ -5398,7 +7026,8 @@ local function set_fov_enabled(enabled, source)
     enabled = enabled == true
 
     if not enabled then
-        if lock_active and fov_applied then
+        CloUtil.stop_combat_fov_tween("FovCommandOff")
+        if fov_applied then
             pcall(restore_fov_defaults)
         end
 
@@ -5415,20 +7044,14 @@ local function set_fov_enabled(enabled, source)
     config.FOVEnabled = true
 
     local applied = false
-    if lock_active and mod_enabled then
-        applied = write_locked_fov()
-
-        if not applied then
-            applied = recover_fov_cache_and_write()
-        end
-
-        fov_applied = applied
+    if mod_enabled and CloUtil.in_combat_context() then
+        applied = CloUtil.start_combat_fov_tween("in", "FovCommandOn")
     end
 
     append_log(
         "FOV COMMAND | Enabled=true" ..
         " | LockOnFOV=" .. tostring(config.LockOnFOV) ..
-        " | Applied=" .. tostring(applied) ..
+        " | CombatTweenStarted=" .. tostring(applied) ..
         " | Source=" .. tostring(source)
     )
 
@@ -5440,16 +7063,14 @@ local function set_mod_enabled(enabled, source)
 
     if not enabled then
         stop_pitch_monitor("MasterOff")
-        CloUtil.restore_combat_offset_z("MasterOff")
-        if config.CameraOffsetFix and CloUtil.in_combat_context() then
-            apply_combat_offset_fix(COMBAT_OFFSET_DEFAULT_Y, "MasterOff")
-        end
+        CloUtil.stop_combat_fov_tween("MasterOff")
         if lock_active then
-            if fov_applied then
-                pcall(restore_fov_defaults)
-            end
-            fov_applied = false
+            CloUtil.restore_lock_offsets("MasterOff")
         end
+        if fov_applied then
+            pcall(restore_fov_defaults)
+        end
+        fov_applied = false
 
         if test_camera_enabled then
             test_camera_suspended = true
@@ -5466,25 +7087,16 @@ local function set_mod_enabled(enabled, source)
 
     mod_enabled = true
 
-    if CloUtil.in_combat_context() and mod_enabled then
-        if CloUtil.combat_offset_z_wanted() then
-            CloUtil.apply_combat_offset_z("MasterOn")
+    if CloUtil.in_combat_context() and mod_enabled and config.FOVEnabled then
+        local tween_reason = "MasterOn"
+        if CloUtil.combat_fov.pending_enter then
+            tween_reason = "PendingCombatEnter"
         end
-        if config.CameraOffsetFix then
-            apply_combat_offset_fix(COMBAT_OFFSET_FIX_Y, "MasterOn")
-        end
+        CloUtil.start_combat_fov_tween("in", tween_reason)
     end
 
     if lock_active then
-        if config.FOVEnabled then
-            local applied = write_locked_fov()
-            if not applied then
-                applied = recover_fov_cache_and_write()
-            end
-            fov_applied = applied
-        else
-            fov_applied = false
-        end
+        CloUtil.apply_lock_offsets("MasterOn")
     elseif test_camera_suspended then
         test_camera_suspended = false
         set_test_camera_enabled(true)
@@ -5494,7 +7106,7 @@ local function set_mod_enabled(enabled, source)
         "MASTER COMMAND | Enabled=true" ..
         " | FOVEnabled=" .. tostring(config.FOVEnabled) ..
         " | LockOnOffsetZ=" .. tostring(config.LockOnOffsetZ) ..
-        " | CameraOffsetFix=" .. tostring(config.CameraOffsetFix) ..
+        " | EnemyOffset=" .. tostring(config.EnemyOffset) ..
         " | Source=" .. tostring(source)
     )
     return true
@@ -5558,23 +7170,19 @@ local function register_mod_hotkey(key_code, key_name, enabled)
 end
 
 
-function CloUtil.set_camera_offset_fix(enabled, source)
-    enabled = enabled == true
-    config.CameraOffsetFix = enabled
+function CloUtil.nudge_enemy_offset(delta, source)
+    local value = (tonumber(config.EnemyOffset) or COMBAT_OFFSET_DEFAULT_Y) + (tonumber(delta) or 0)
+    config.EnemyOffset = value
 
-    if mod_enabled and CloUtil.in_combat_context() then
-        if enabled then
-            apply_combat_offset_fix(COMBAT_OFFSET_FIX_Y, source or "SettingsUI")
-        else
-            apply_combat_offset_fix(COMBAT_OFFSET_DEFAULT_Y, source or "SettingsUI")
-        end
+    if mod_enabled and lock_active then
+        CloUtil.apply_enemy_offset(source or "NudgeEnemyOffset")
     end
 
     append_log(
-        "OFFSET FIX COMMAND | Enabled=" .. tostring(enabled) ..
+        "ENEMY OFFSET NUDGE | EnemyOffset=" .. tostring(config.EnemyOffset) ..
         " | Source=" .. tostring(source)
     )
-    return true
+    return config.EnemyOffset
 end
 
 function CloUtil.nudge_lock_on_fov(delta, source)
@@ -5587,12 +7195,8 @@ function CloUtil.nudge_lock_on_fov(delta, source)
 
     config.LockOnFOV = value
 
-    if lock_active and mod_enabled and config.FOVEnabled then
-        local ok = write_locked_fov()
-        if not ok then
-            ok = recover_fov_cache_and_write()
-        end
-        fov_applied = ok
+    if mod_enabled and config.FOVEnabled and CloUtil.in_combat_context() then
+        CloUtil.start_combat_fov_tween("in", source or "NudgeFOV")
     end
 
     append_log(
@@ -5606,9 +7210,9 @@ function CloUtil.nudge_lock_on_offset_z(delta, source)
     local value = (tonumber(config.LockOnOffsetZ) or 0) + (tonumber(delta) or 0)
     config.LockOnOffsetZ = value
 
-    if mod_enabled and CloUtil.in_combat_context() and CloUtil.combat_offset_z_wanted() then
+    if mod_enabled and lock_active and CloUtil.combat_offset_z_wanted() then
         CloUtil.apply_combat_offset_z(source or "NudgeZ")
-    elseif mod_enabled and not CloUtil.combat_offset_z_wanted() then
+    elseif mod_enabled and lock_active then
         CloUtil.restore_combat_offset_z(source or "NudgeZZero")
     end
 
@@ -5620,9 +7224,29 @@ function CloUtil.nudge_lock_on_offset_z(delta, source)
 end
 
 -- PageDown/PageUp are the master switch for FOV, offset, and camera tests.
+-- End is a log-only combat-over mark and must not disable the mod.
 if type(RegisterKeyBind) == "function" and type(Key) == "table" then
     register_mod_hotkey(Key.PAGE_DOWN, "PageDown", false)
     register_mod_hotkey(Key.PAGE_UP, "PageUp", true)
+    pcall(function()
+        local end_key = Key.END or Key.End or Key.END_KEY
+        if end_key == nil then
+            append_log("HOTKEY UNAVAILABLE | End key is not present in the UE4SS Key table")
+            return
+        end
+        local ok, err = pcall(function()
+            RegisterKeyBind(end_key, function()
+                CloUtil.log_user_mark("End")
+            end)
+        end)
+        if ok then
+            append_log("HOTKEY REGISTERED | End=USER MARK CombatOver")
+        else
+            append_log(
+                "HOTKEY REGISTER FAILED | End | Error=" .. tostring(err)
+            )
+        end
+    end)
 else
     append_log("HOTKEY UNAVAILABLE | RegisterKeyBind or Key table unavailable")
 end
@@ -5645,16 +7269,23 @@ RegisterConsoleCommandHandler(
         if command == "?" or command == "" then
             Ar:Log("clo mod 0 | clo mod 1")
             Ar:Log("clo fov 0 | clo fov 1 | clo fov value <1-179>")
-            Ar:Log("clo offset 0 | clo offset 1")
+            Ar:Log("clo offset value <number>  (120 = game default)")
             Ar:Log("clo z <value>   (runtime LockOnOffsetZ; also saved for this session)")
             Ar:Log("clo ui | clo fovstatus")
             Ar:Log("clo ver")
-            Ar:Log("PageDown = master OFF | PageUp = master ON")
+            Ar:Log("clo mark          (log CombatOver; same as End)")
+            Ar:Log("PageDown = master OFF | PageUp = master ON | End = USER MARK")
             return true
         end
 
         if command == "ver" then
             Ar:Log("LockOnFovChanger version: " .. SCRIPT_VERSION)
+            return true
+        end
+
+        if command == "mark" then
+            CloUtil.log_user_mark("Console: clo mark")
+            Ar:Log("USER MARK CombatOver written")
             return true
         end
 
@@ -5693,12 +7324,8 @@ RegisterConsoleCommandHandler(
                 if value ~= nil and value >= 1 and value <= 179 then
                     config.LockOnFOV = value
                     ExecuteInGameThread(function()
-                        if lock_active and mod_enabled and config.FOVEnabled then
-                            local ok = write_locked_fov()
-                            if not ok then
-                                ok = recover_fov_cache_and_write()
-                            end
-                            fov_applied = ok
+                        if mod_enabled and config.FOVEnabled and CloUtil.in_combat_context() then
+                            CloUtil.start_combat_fov_tween("in", "ConsoleFovValue")
                         end
                         append_log("CONSOLE | LockOnFOV=" .. tostring(config.LockOnFOV))
                     end)
@@ -5714,31 +7341,56 @@ RegisterConsoleCommandHandler(
         end
 
         if command == "offset" then
-            if arg == "0" then
-                config.CameraOffsetFix = false
-                ExecuteInGameThread(function()
-                    if mod_enabled and CloUtil.in_combat_context() then
-                        apply_combat_offset_fix(COMBAT_OFFSET_DEFAULT_Y, "Console")
+            local value_arg = Parameters[3]
+
+            if arg == "value" then
+                local value = tonumber(value_arg)
+                if value ~= nil then
+                    config.EnemyOffset = value
+                    ExecuteInGameThread(function()
+                        local changed = 0
+                        if mod_enabled and lock_active then
+                            changed = apply_combat_offset_fix(value, "ConsoleEnemyOffset")
+                        end
+                        append_log(
+                            "CONSOLE | EnemyOffset=" .. tostring(config.EnemyOffset) ..
+                            " | Changed=" .. tostring(changed) ..
+                            " | LockActive=" .. tostring(lock_active)
+                        )
+                    end)
+                    if lock_active then
+                        Ar:Log("EnemyOffset=" .. tostring(config.EnemyOffset))
+                    else
+                        Ar:Log(
+                            "EnemyOffset=" .. tostring(config.EnemyOffset) ..
+                            " (saved; lock on to apply)"
+                        )
                     end
-                    append_log("CONSOLE | CameraOffsetFix=false")
-                end)
-                Ar:Log("CameraOffsetFix=false")
+                    return true
+                end
+                Ar:Log("Usage: clo offset value <number>")
                 return true
             end
 
-            if arg == "1" then
-                config.CameraOffsetFix = true
+            local direct_value = tonumber(arg)
+            if direct_value ~= nil then
+                config.EnemyOffset = direct_value
                 ExecuteInGameThread(function()
-                    if mod_enabled and CloUtil.in_combat_context() then
-                        apply_combat_offset_fix(COMBAT_OFFSET_FIX_Y, "Console")
+                    local changed = 0
+                    if mod_enabled and lock_active then
+                        changed = apply_combat_offset_fix(direct_value, "ConsoleEnemyOffset")
                     end
-                    append_log("CONSOLE | CameraOffsetFix=true")
+                    append_log(
+                        "CONSOLE | EnemyOffset=" .. tostring(config.EnemyOffset) ..
+                        " | Changed=" .. tostring(changed) ..
+                        " | LockActive=" .. tostring(lock_active)
+                    )
                 end)
-                Ar:Log("CameraOffsetFix=true")
+                Ar:Log("EnemyOffset=" .. tostring(config.EnemyOffset))
                 return true
             end
 
-            Ar:Log("Usage: clo offset 0 | clo offset 1")
+            Ar:Log("Usage: clo offset value <number>")
             return true
         end
 
@@ -5752,7 +7404,7 @@ RegisterConsoleCommandHandler(
             config.LockOnOffsetZ = value
 
             local function apply_z_command()
-                if mod_enabled and CloUtil.in_combat_context() then
+                if mod_enabled and lock_active then
                     if CloUtil.combat_offset_z_wanted() then
                         CloUtil.apply_combat_offset_z("ConsoleLockOnOffsetZ")
                     else
@@ -5760,9 +7412,9 @@ RegisterConsoleCommandHandler(
                     end
                 end
                 append_log(
-                    "COMBAT OFFSET Z COMMAND" ..
+                    "LOCK OFFSET Z COMMAND" ..
                     " | Value=" .. tostring(value) ..
-                    " | InCombat=" .. tostring(CloUtil.in_combat_context()) ..
+                    " | LockActive=" .. tostring(lock_active) ..
                     " | ModEnabled=" .. tostring(mod_enabled)
                 )
             end
@@ -5783,7 +7435,7 @@ RegisterConsoleCommandHandler(
             Ar:Log("FOVEnabled=" .. tostring(config.FOVEnabled))
             Ar:Log("LockOnFOV=" .. tostring(config.LockOnFOV))
             Ar:Log("LockOnOffsetZ=" .. tostring(config.LockOnOffsetZ))
-            Ar:Log("CameraOffsetFix=" .. tostring(config.CameraOffsetFix))
+            Ar:Log("EnemyOffset=" .. tostring(config.EnemyOffset))
             Ar:Log("LockActive=" .. tostring(lock_active))
             return true
         end
@@ -5793,7 +7445,7 @@ RegisterConsoleCommandHandler(
             Ar:Log("FOVEnabled=" .. tostring(config.FOVEnabled))
             Ar:Log("LockOnFOV=" .. tostring(config.LockOnFOV))
             Ar:Log("LockOnOffsetZ=" .. tostring(config.LockOnOffsetZ))
-            Ar:Log("CameraOffsetFix=" .. tostring(config.CameraOffsetFix))
+            Ar:Log("EnemyOffset=" .. tostring(config.EnemyOffset))
             Ar:Log("EnableLog=" .. tostring(config.EnableLog))
             Ar:Log("FOVApplied=" .. tostring(fov_applied))
             Ar:Log("LockActive=" .. tostring(lock_active))
@@ -5812,7 +7464,7 @@ append_log(
     " | FOVEnabled=" .. tostring(config.FOVEnabled) ..
     " | LockOnFOV=" .. tostring(config.LockOnFOV) ..
     " | LockOnOffsetZ=" .. tostring(config.LockOnOffsetZ) ..
-    " | CameraOffsetFix=" .. tostring(config.CameraOffsetFix) ..
+    " | EnemyOffset=" .. tostring(config.EnemyOffset) ..
     " | EnableLog=" .. tostring(config.EnableLog)
 )
 
